@@ -13,6 +13,16 @@ ln -sf ~/Work/pi-extension/openrouter-provider.ts ~/.pi/agent/extensions/openrou
 
 Run `/reload` in Pi after changing the extension.
 
+## Development
+
+```bash
+npm install --ignore-scripts
+npm run check
+npm run format
+```
+
+Linting uses Oxlint with Ultracite's core rules. Formatting uses Oxfmt with Ultracite defaults.
+
 ## Known routing behavior
 
 OpenRouter may rerank complex tool-enabled requests despite an explicit provider order. The extension sends the selected provider first with fallbacks enabled, but strict first-provider enforcement would require client-side retries using one provider per attempt.

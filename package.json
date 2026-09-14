@@ -1,0 +1,22 @@
+{
+  "name": "pi-openrouter-provider-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "npm run lint && npm run format:check && npm run typecheck",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "26.0.0",
+    "oxfmt": "0.65.0",
+    "oxlint": "1.82.0",
+    "oxlint-tsgolint": "7",
+    "typescript": "7.0.2",
+    "ultracite": "7.11.1"
+  }
+}
