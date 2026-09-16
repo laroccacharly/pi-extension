@@ -11,6 +11,10 @@ import type {
 interface OpenRouterGenerationData {
   provider_name?: string
   total_cost?: number | null
+  /** Number of tokens in the completion. */
+  tokens_completion?: number | null
+  /** Time taken for generation in milliseconds. */
+  generation_time?: number | null
 }
 
 interface OpenRouterGenerationResponse {
@@ -90,6 +94,7 @@ const generationRequests = new Map<
 >()
 let generationCostTotal = 0
 let lastTurnCost: number | undefined
+let lastTurnTps: number | undefined
 let lastProviderName: string | undefined
 
 function normalizeModelId(modelId: string): string {
@@ -164,6 +169,9 @@ function renderOpenRouterStatus(ctx: ExtensionContext): void {
     `($${lastTurnCost.toFixed(4)})`,
     `$${generationCostTotal.toFixed(4)}`,
   ]
+  if (lastTurnTps !== undefined) {
+    parts.push(`${lastTurnTps.toFixed(1)} t/s`)
+  }
   if (lastProviderName !== undefined) {
     parts.push(lastProviderName)
   }
@@ -180,6 +188,13 @@ function recordGenerationCost(
     generationCosts.set(generationId, cost)
     generationCostTotal += cost
     lastTurnCost = cost
+
+    const tokens = data.tokens_completion ?? 0
+    const generationTimeMs = data.generation_time ?? 0
+    lastTurnTps =
+      tokens > 0 && generationTimeMs > 0
+        ? tokens / (generationTimeMs / 1000)
+        : undefined
   }
   if (data?.provider_name !== undefined) {
     lastProviderName = data.provider_name
@@ -490,6 +505,7 @@ export default function openRouterProvider(pi: ExtensionAPI) {
     generationRequests.clear()
     generationCostTotal = 0
     lastTurnCost = undefined
+    lastTurnTps = undefined
     lastProviderName = undefined
 
     const routeOrder =

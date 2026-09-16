@@ -1,10 +1,10 @@
 # Pi OpenRouter Provider Extension
 
-Pi extension that displays the OpenRouter upstream provider used for each response and the actual USD spend reported by OpenRouter.
+Pi extension that displays the OpenRouter upstream provider used for each response, the actual USD spend, and the generation speed reported by OpenRouter.
 
 ## Actual spend
 
-Pi prices OpenRouter tokens from the static model catalog, which ignores OpenRouter's per-request cost (routing, time-of-day price overrides, fees). After each assistant response the extension fetches `GET /api/v1/generation?id=<responseId>` and reads the returned `total_cost`. The footer status shows `OpenRouter: ($lastTurn), $sessionTotal, providerName`, i.e. last response cost, cumulative session cost, and upstream provider. This is OpenRouter's authoritative billed cost, so it can differ from the estimate in Pi's built-in cost display. The totals reset when a new session starts.
+Pi prices OpenRouter tokens from the static model catalog, which ignores OpenRouter's per-request cost (routing, time-of-day price overrides, fees). After each assistant response the extension fetches `GET /api/v1/generation?id=<responseId>` and reads the returned `total_cost`, `tokens_completion`, and `generation_time`. The footer status shows `OpenRouter: ($lastTurn), $sessionTotal, tokensPerSecond, providerName`, i.e. last response cost, cumulative session cost, the actual generation speed in tokens per second (`tokens_completion / (generation_time / 1000)`), and upstream provider. This is OpenRouter's authoritative billed cost, so it can differ from the estimate in Pi's built-in cost display. The totals reset when a new session starts.
 
 The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one persists a preferred provider order with fallbacks in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override.
 
