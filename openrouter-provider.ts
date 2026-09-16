@@ -24,10 +24,6 @@ interface OpenRouterGenerationData {
   generation_time?: number | null
 }
 
-interface OpenRouterGenerationResponse {
-  data?: OpenRouterGenerationData
-}
-
 interface OpenRouterEndpoint {
   provider_name?: string
   tag?: string
@@ -35,12 +31,6 @@ interface OpenRouterEndpoint {
   latency_last_30m?: { p50?: number }
   throughput_last_30m?: { p50?: number }
   uptime_last_30m?: number
-}
-
-interface OpenRouterEndpointsResponse {
-  data?: {
-    endpoints?: OpenRouterEndpoint[]
-  }
 }
 
 interface OpenRouterModelArchitecture {
@@ -69,10 +59,6 @@ interface OpenRouterModel {
   pricing?: OpenRouterModelPricing
   top_provider?: OpenRouterModelTopProvider
   supported_parameters?: string[]
-}
-
-interface OpenRouterModelsResponse {
-  data?: OpenRouterModel[]
 }
 
 interface OpenRouterModelsCache {
@@ -108,6 +94,8 @@ const generationRequests = new Map<
   string,
   Promise<OpenRouterGenerationData | undefined>
 >()
+/** Resolved generation data, kept so repeated lookups do not re-request. */
+const resolvedGenerations = new Map<string, OpenRouterGenerationData>()
 let generationCostTotal = 0
 let lastTurnCost: number | undefined
 let lastTurnTps: number | undefined
@@ -136,10 +124,82 @@ async function getOpenRouterHeaders(ctx: ExtensionContext): Promise<Headers> {
   return headers
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function toProviderResponse(
+  value: unknown
+): OpenRouterProviderResponse | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+  return {
+    provider_name: readString(value.provider_name),
+    status: readFiniteNumber(value.status),
+  }
+}
+
+function toGenerationData(
+  value: unknown
+): OpenRouterGenerationData | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+  const responses = Array.isArray(value.provider_responses)
+    ? value.provider_responses
+        .map((item) => toProviderResponse(item))
+        .filter(
+          (item): item is OpenRouterProviderResponse => item !== undefined
+        )
+    : undefined
+  return {
+    provider_name: readString(value.provider_name),
+    provider_responses: responses,
+    total_cost: readFiniteNumber(value.total_cost),
+    tokens_completion: readFiniteNumber(value.tokens_completion),
+    generation_time: readFiniteNumber(value.generation_time),
+  }
+}
+
+function toP50(value: unknown): { p50?: number } | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+  return { p50: readFiniteNumber(value.p50) }
+}
+
+function toEndpoint(value: unknown): OpenRouterEndpoint | undefined {
+  if (!isRecord(value) || typeof value.tag !== "string") {
+    return undefined
+  }
+  return {
+    provider_name: readString(value.provider_name),
+    tag: value.tag,
+    status: readFiniteNumber(value.status),
+    latency_last_30m: toP50(value.latency_last_30m),
+    throughput_last_30m: toP50(value.throughput_last_30m),
+    uptime_last_30m: readFiniteNumber(value.uptime_last_30m),
+  }
+}
+
 async function fetchGeneration(
   generationId: string,
   ctx: ExtensionContext
 ): Promise<OpenRouterGenerationData | undefined> {
+  const resolved = resolvedGenerations.get(generationId)
+  if (resolved !== undefined) {
+    return resolved
+  }
+
   const existing = generationRequests.get(generationId)
   if (existing !== undefined) {
     return await existing
@@ -166,8 +226,8 @@ async function fetchGeneration(
           throw new Error(`OpenRouter returned HTTP ${response.status}`)
         }
 
-        const result = (await response.json()) as OpenRouterGenerationResponse
-        return result.data
+        const result: unknown = await response.json()
+        return isRecord(result) ? toGenerationData(result.data) : undefined
       }
     } catch {
       // Fall through and let the caller treat this generation as unresolved.
@@ -175,7 +235,15 @@ async function fetchGeneration(
   })()
 
   generationRequests.set(generationId, request)
-  return await request
+  try {
+    const data = await request
+    if (data !== undefined) {
+      resolvedGenerations.set(generationId, data)
+    }
+    return data
+  } finally {
+    generationRequests.delete(generationId)
+  }
 }
 
 function fallbackProviders(
@@ -241,14 +309,19 @@ function recordGenerationCost(
   renderOpenRouterStatus(ctx)
 }
 
+/** Replace a JSON file atomically, creating it with owner-only permissions. */
+function writeJsonFile(path: string, value: unknown): void {
+  const temporaryPath = `${path}.${process.pid}.tmp`
+  writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
+    mode: 0o600,
+  })
+  renameSync(temporaryPath, path)
+}
+
 function loadSelectedRoutes(): Map<string, string[]> {
   try {
     const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"))
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed)
-    ) {
+    if (!isRecord(parsed)) {
       return new Map()
     }
 
@@ -269,17 +342,7 @@ function loadSelectedRoutes(): Map<string, string[]> {
 }
 
 function saveSelectedRoutes(routes: Map<string, string[]>): void {
-  const temporaryPath = `${CONFIG_PATH}.${process.pid}.tmp`
-  writeFileSync(
-    temporaryPath,
-    `${JSON.stringify(Object.fromEntries(routes), null, 2)}\n`,
-    { mode: 0o600 }
-  )
-  renameSync(temporaryPath, CONFIG_PATH)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
+  writeJsonFile(CONFIG_PATH, Object.fromEntries(routes))
 }
 
 function isOpenRouterModel(value: unknown): value is OpenRouterModel {
@@ -368,13 +431,7 @@ function loadModelsCache(): OpenRouterModelsCache | undefined {
 
 function saveModelsCache(models: OpenRouterModel[]): void {
   try {
-    const temporaryPath = `${MODELS_CACHE_PATH}.${process.pid}.tmp`
-    writeFileSync(
-      temporaryPath,
-      `${JSON.stringify({ checkedAt: Date.now(), models }, null, 2)}\n`,
-      { mode: 0o600 }
-    )
-    renameSync(temporaryPath, MODELS_CACHE_PATH)
+    writeJsonFile(MODELS_CACHE_PATH, { checkedAt: Date.now(), models })
   } catch {
     // Cache persistence is best effort.
   }
@@ -414,11 +471,7 @@ function loadRecentModels(): RecentModelEntry[] {
 
 function saveRecentModels(models: RecentModelEntry[]): void {
   try {
-    const temporaryPath = `${LAST_MODELS_PATH}.${process.pid}.tmp`
-    writeFileSync(temporaryPath, `${JSON.stringify(models, null, 2)}\n`, {
-      mode: 0o600,
-    })
-    renameSync(temporaryPath, LAST_MODELS_PATH)
+    writeJsonFile(LAST_MODELS_PATH, models)
   } catch {
     // Recent-model persistence is best effort.
   }
@@ -450,8 +503,9 @@ async function fetchOpenRouterModels(
   if (!response.ok) {
     throw new Error(`OpenRouter returned HTTP ${response.status}`)
   }
-  const result = (await response.json()) as OpenRouterModelsResponse
-  return (result.data ?? []).filter(isChatModel)
+  const result: unknown = await response.json()
+  const data = isRecord(result) && Array.isArray(result.data) ? result.data : []
+  return data.filter(isOpenRouterModel).filter(isChatModel)
 }
 
 /**
@@ -473,20 +527,159 @@ function registerOpenRouterModels(
 
   let added = 0
   for (const model of liveModels) {
-    if (merged.has(model.id)) {
-      continue
+    if (!merged.has(model.id)) {
+      merged.set(model.id, toProviderModel(model))
+      added += 1
     }
-    merged.set(model.id, toProviderModel(model))
-    added += 1
   }
 
   pi.registerProvider("openrouter", { models: [...merged.values()] })
   return added
 }
 
-export default function openRouterProvider(pi: ExtensionAPI) {
-  const selectedRoutes = loadSelectedRoutes()
+async function refreshModelsInBackground(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext
+): Promise<void> {
+  try {
+    const liveModels = await fetchOpenRouterModels(ctx)
+    if (liveModels.length === 0) {
+      return
+    }
+    saveModelsCache(liveModels)
+    registerOpenRouterModels(pi, ctx, liveModels)
+  } catch {
+    // Keep the cached catalog when OpenRouter is unreachable.
+  }
+}
 
+async function refreshGeneration(
+  generationId: string,
+  ctx: ExtensionContext
+): Promise<void> {
+  const data = await fetchGeneration(generationId, ctx)
+  recordGenerationCost(generationId, data, ctx)
+}
+
+function formatModelOption(
+  model: OpenRouterModel,
+  knownIds: Set<string>
+): string {
+  const badge = knownIds.has(model.id) ? "" : " [new]"
+  return `${model.name ?? model.id}${badge} — ${model.id}`
+}
+
+function formatEndpointOption(
+  endpoint: OpenRouterEndpoint,
+  index: number
+): string {
+  const throughput = endpoint.throughput_last_30m?.p50 ?? 0
+  const latency = endpoint.latency_last_30m?.p50
+  const uptime = endpoint.uptime_last_30m
+  const latencyText =
+    latency === undefined ? "n/a" : `${(latency / 1000).toFixed(2)} s`
+  const uptimeText = uptime === undefined ? "n/a" : `${uptime.toFixed(2)}%`
+  return `${index + 1}. ${endpoint.provider_name ?? "Unknown"} — ${throughput} t/s · ${latencyText} latency · ${uptimeText} uptime`
+}
+
+async function fetchEndpoints(
+  ctx: ExtensionContext,
+  modelId: string
+): Promise<OpenRouterEndpoint[]> {
+  const response = await fetch(
+    `https://openrouter.ai/api/v1/models/${modelId}/endpoints`,
+    { headers: await getOpenRouterHeaders(ctx) }
+  )
+  if (!response.ok) {
+    throw new Error(`OpenRouter returned HTTP ${response.status}`)
+  }
+  const result: unknown = await response.json()
+  if (
+    !isRecord(result) ||
+    !isRecord(result.data) ||
+    !Array.isArray(result.data.endpoints)
+  ) {
+    return []
+  }
+  return result.data.endpoints
+    .map((value) => toEndpoint(value))
+    .filter(
+      (endpoint): endpoint is OpenRouterEndpoint => endpoint !== undefined
+    )
+}
+
+function isHealthyEndpoint(endpoint: OpenRouterEndpoint): boolean {
+  return (
+    endpoint.status === 0 &&
+    endpoint.tag !== undefined &&
+    endpoint.throughput_last_30m?.p50 !== undefined
+  )
+}
+
+function sortByThroughput(
+  endpoints: OpenRouterEndpoint[]
+): OpenRouterEndpoint[] {
+  return endpoints.toSorted(
+    (left, right) =>
+      (right.throughput_last_30m?.p50 ?? 0) -
+      (left.throughput_last_30m?.p50 ?? 0)
+  )
+}
+
+function endpointProviderName(
+  endpoint: OpenRouterEndpoint
+): string | undefined {
+  return endpoint.tag?.split("/")[0]
+}
+
+/**
+ * Prefer the selected provider, then keep the remaining healthy providers in
+ * throughput order as a fallback list for later routing decisions.
+ */
+function buildRouteOrder(
+  selectedProvider: string,
+  healthyEndpoints: OpenRouterEndpoint[]
+): string[] {
+  const others = sortByThroughput(healthyEndpoints)
+    .map((endpoint) => endpointProviderName(endpoint))
+    .filter(
+      (name, index, names): name is string =>
+        name !== undefined &&
+        name !== selectedProvider &&
+        names.indexOf(name) === index
+    )
+  return [selectedProvider, ...others]
+}
+
+type ProviderChoice =
+  | { kind: "auto" }
+  | { kind: "provider"; endpoint: OpenRouterEndpoint }
+
+async function chooseProvider(
+  ctx: ExtensionContext,
+  modelId: string,
+  top: OpenRouterEndpoint[]
+): Promise<ProviderChoice | undefined> {
+  const providerOptions = top.map(formatEndpointOption)
+  const autoOption = "Auto-route by throughput"
+  const selection = await ctx.ui.select(
+    `OpenRouter providers for ${modelId} (30m p50)`,
+    [autoOption, ...providerOptions]
+  )
+  if (selection === undefined) {
+    return undefined
+  }
+  if (selection === autoOption) {
+    return { kind: "auto" }
+  }
+  const endpoint = top[providerOptions.indexOf(selection)]
+  return endpoint === undefined ? undefined : { kind: "provider", endpoint }
+}
+
+function registerProviderSelectionCommand(
+  pi: ExtensionAPI,
+  selectedRoutes: Map<string, string[]>
+): void {
   pi.registerCommand("openrouter-providers", {
     description:
       "Choose among the five highest-throughput providers or use automatic routing",
@@ -498,54 +691,21 @@ export default function openRouterProvider(pi: ExtensionAPI) {
 
       try {
         const modelId = normalizeModelId(ctx.model.id)
-        const response = await fetch(
-          `https://openrouter.ai/api/v1/models/${modelId}/endpoints`,
-          {
-            headers: await getOpenRouterHeaders(ctx),
-          }
-        )
-        if (!response.ok) {
-          throw new Error(`OpenRouter returned HTTP ${response.status}`)
-        }
-
-        const result = (await response.json()) as OpenRouterEndpointsResponse
-        const endpoints = result.data?.endpoints ?? []
-        const healthyEndpoints = endpoints.filter(
-          (endpoint) =>
-            endpoint.status === 0 &&
-            endpoint.tag !== undefined &&
-            endpoint.throughput_last_30m?.p50 !== undefined
-        )
-        const top = healthyEndpoints
-          .toSorted(
-            (left, right) =>
-              (right.throughput_last_30m?.p50 ?? 0) -
-              (left.throughput_last_30m?.p50 ?? 0)
-          )
-          .slice(0, 5)
-
+        const endpoints = await fetchEndpoints(ctx, modelId)
+        const healthyEndpoints = endpoints.filter(isHealthyEndpoint)
+        const top = sortByThroughput(healthyEndpoints).slice(0, 5)
         if (top.length === 0) {
           throw new Error(
             "OpenRouter returned no healthy endpoints with throughput data"
           )
         }
 
-        const providerOptions = top.map((endpoint, index) => {
-          const throughput = endpoint.throughput_last_30m?.p50 ?? 0
-          const latency = endpoint.latency_last_30m?.p50
-          const uptime = endpoint.uptime_last_30m
-          return `${index + 1}. ${endpoint.provider_name ?? "Unknown"} — ${throughput} t/s · ${latency === undefined ? "n/a" : `${(latency / 1000).toFixed(2)} s`} latency · ${uptime === undefined ? "n/a" : `${uptime.toFixed(2)}%`} uptime`
-        })
-        const autoOption = "Auto-route by throughput"
-        const selection = await ctx.ui.select(
-          `OpenRouter providers for ${modelId} (30m p50)`,
-          [autoOption, ...providerOptions]
-        )
-        if (selection === undefined) {
+        const choice = await chooseProvider(ctx, modelId, top)
+        if (choice === undefined) {
           return
         }
 
-        if (selection === autoOption) {
+        if (choice.kind === "auto") {
           selectedRoutes.delete(modelId)
           saveSelectedRoutes(selectedRoutes)
           ctx.ui.setStatus(
@@ -555,33 +715,16 @@ export default function openRouterProvider(pi: ExtensionAPI) {
           return
         }
 
-        const selectedIndex = providerOptions.indexOf(selection)
-        const endpoint = top[selectedIndex]
-        if (endpoint?.tag === undefined) {
-          throw new Error("Selected provider is unavailable")
-        }
-
-        const [selectedProvider] = endpoint.tag.split("/")
+        const { endpoint } = choice
+        const selectedProvider = endpointProviderName(endpoint)
         if (selectedProvider === undefined) {
           throw new Error("Selected provider is unavailable")
         }
-        const routeOrder = [
-          selectedProvider,
-          ...healthyEndpoints
-            .toSorted(
-              (left, right) =>
-                (right.throughput_last_30m?.p50 ?? 0) -
-                (left.throughput_last_30m?.p50 ?? 0)
-            )
-            .map((candidate) => candidate.tag?.split("/")[0])
-            .filter(
-              (tag, index, tags): tag is string =>
-                tag !== undefined &&
-                tag !== selectedProvider &&
-                tags.indexOf(tag) === index
-            ),
-        ]
-        selectedRoutes.set(modelId, routeOrder)
+
+        selectedRoutes.set(
+          modelId,
+          buildRouteOrder(selectedProvider, healthyEndpoints)
+        )
         saveSelectedRoutes(selectedRoutes)
         ctx.ui.setStatus(
           "openrouter-provider",
@@ -595,29 +738,9 @@ export default function openRouterProvider(pi: ExtensionAPI) {
       }
     },
   })
+}
 
-  pi.on("session_start", (_event, ctx) => {
-    generationCosts.clear()
-    generationRequests.clear()
-    generationCostTotal = 0
-    lastTurnCost = undefined
-    lastTurnTps = undefined
-    lastProviderName = undefined
-    lastFallbackProviders = []
-
-    const routeOrder =
-      ctx.model?.provider === "openrouter"
-        ? selectedRoutes.get(normalizeModelId(ctx.model.id))
-        : undefined
-    const preferredProvider = routeOrder?.[0]
-    ctx.ui.setStatus(
-      "openrouter-provider",
-      preferredProvider === undefined
-        ? undefined
-        : `OpenRouter: preferring ${preferredProvider}`
-    )
-  })
-
+function registerModelsCommand(pi: ExtensionAPI): void {
   pi.registerCommand("openrouter-models", {
     description: "Fetch the latest OpenRouter models and select one",
     handler: async (_args, ctx) => {
@@ -639,10 +762,9 @@ export default function openRouterProvider(pi: ExtensionAPI) {
         const recent = liveModels
           .toSorted((left, right) => (right.created ?? 0) - (left.created ?? 0))
           .slice(0, RECENT_MODELS_LIMIT)
-        const options = recent.map((model) => {
-          const badge = priorIds.has(model.id) ? "" : " [new]"
-          return `${model.name ?? model.id}${badge} — ${model.id}`
-        })
+        const options = recent.map((model) =>
+          formatModelOption(model, priorIds)
+        )
 
         const selection = await ctx.ui.select(
           `OpenRouter models (${added} new of ${liveModels.length})`,
@@ -680,7 +802,9 @@ export default function openRouterProvider(pi: ExtensionAPI) {
       }
     },
   })
+}
 
+function registerRecentModelsCommand(pi: ExtensionAPI): void {
   pi.registerCommand("last-models", {
     description: "Switch to one of the five most recently used models",
     handler: async (_args, ctx) => {
@@ -723,7 +847,72 @@ export default function openRouterProvider(pi: ExtensionAPI) {
       ctx.ui.notify(`Using ${model.name}`, "info")
     },
   })
+}
 
+function registerSessionStatusHandlers(
+  pi: ExtensionAPI,
+  selectedRoutes: Map<string, string[]>
+): void {
+  pi.on("session_start", (_event, ctx) => {
+    generationCosts.clear()
+    generationRequests.clear()
+    resolvedGenerations.clear()
+    generationCostTotal = 0
+    lastTurnCost = undefined
+    lastTurnTps = undefined
+    lastProviderName = undefined
+    lastFallbackProviders = []
+
+    const routeOrder =
+      ctx.model?.provider === "openrouter"
+        ? selectedRoutes.get(normalizeModelId(ctx.model.id))
+        : undefined
+    const preferredProvider = routeOrder?.[0]
+    ctx.ui.setStatus(
+      "openrouter-provider",
+      preferredProvider === undefined
+        ? undefined
+        : `OpenRouter: preferring ${preferredProvider}`
+    )
+  })
+
+  pi.on("before_provider_request", (event, ctx) => {
+    if (ctx.model?.provider !== "openrouter") {
+      return
+    }
+    const preferredProvider = selectedRoutes
+      .get(normalizeModelId(ctx.model.id))
+      ?.at(0)
+    if (preferredProvider === undefined || !isRecord(event.payload)) {
+      return
+    }
+
+    const provider = isRecord(event.payload.provider)
+      ? { ...event.payload.provider }
+      : {}
+    // Never sort by price and never fall back to another provider: pin the
+    // selected endpoint as the only allowed one so OpenRouter cannot rerank.
+    delete provider.sort
+    delete provider.order
+    provider.only = [preferredProvider]
+    provider.allow_fallbacks = false
+    return {
+      ...event.payload,
+      provider,
+    }
+  })
+
+  pi.on("before_provider_headers", (event, ctx) => {
+    if (
+      ctx.model?.provider === "openrouter" &&
+      selectedRoutes.has(normalizeModelId(ctx.model.id))
+    ) {
+      event.headers["x-session-id"] = null
+    }
+  })
+}
+
+function registerModelTrackingHandlers(pi: ExtensionAPI): void {
   pi.on("model_select", (event) => {
     recordModelUse(event.model.provider, event.model.id, event.model.name)
   })
@@ -739,78 +928,6 @@ export default function openRouterProvider(pi: ExtensionAPI) {
     recordModelUse(message.provider, message.model, name)
   })
 
-  pi.on("session_start", (_event, ctx) => {
-    const cache = loadModelsCache()
-    if (cache !== undefined) {
-      registerOpenRouterModels(pi, ctx, cache.models)
-    }
-
-    const cacheIsFresh =
-      cache !== undefined && Date.now() - cache.checkedAt < MODELS_CACHE_TTL_MS
-    if (cacheIsFresh) {
-      return
-    }
-
-    void (async () => {
-      try {
-        const liveModels = await fetchOpenRouterModels(ctx)
-        if (liveModels.length === 0) {
-          return
-        }
-        saveModelsCache(liveModels)
-        registerOpenRouterModels(pi, ctx, liveModels)
-      } catch {
-        // Keep the cached catalog when OpenRouter is unreachable.
-      }
-    })()
-  })
-
-  pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== "openrouter") {
-      return
-    }
-    const preferredProvider = selectedRoutes
-      .get(normalizeModelId(ctx.model.id))
-      ?.at(0)
-    if (
-      preferredProvider === undefined ||
-      event.payload === null ||
-      event.payload === undefined ||
-      typeof event.payload !== "object" ||
-      Array.isArray(event.payload)
-    ) {
-      return
-    }
-
-    const payload = event.payload as Record<string, unknown>
-    const provider =
-      payload.provider !== null &&
-      payload.provider !== undefined &&
-      typeof payload.provider === "object" &&
-      !Array.isArray(payload.provider)
-        ? { ...(payload.provider as Record<string, unknown>) }
-        : {}
-    // Never sort by price and never fall back to another provider: pin the
-    // selected endpoint as the only allowed one so OpenRouter cannot rerank.
-    delete provider.sort
-    delete provider.order
-    provider.only = [preferredProvider]
-    provider.allow_fallbacks = false
-    return {
-      ...payload,
-      provider,
-    }
-  })
-
-  pi.on("before_provider_headers", (event, ctx) => {
-    if (
-      ctx.model?.provider === "openrouter" &&
-      selectedRoutes.has(normalizeModelId(ctx.model.id))
-    ) {
-      event.headers["x-session-id"] = null
-    }
-  })
-
   pi.on("message_end", (event, ctx) => {
     const { message } = event
     if (message.role !== "assistant" || message.provider !== "openrouter") {
@@ -820,10 +937,27 @@ export default function openRouterProvider(pi: ExtensionAPI) {
     if (generationId === undefined) {
       return
     }
-    void (async () => {
-      const data = await fetchGeneration(generationId, ctx)
-      recordGenerationCost(generationId, data, ctx)
-    })()
+    void refreshGeneration(generationId, ctx)
+  })
+}
+
+function registerCatalogHandlers(
+  pi: ExtensionAPI,
+  selectedRoutes: Map<string, string[]>
+): void {
+  registerSessionStatusHandlers(pi, selectedRoutes)
+
+  pi.on("session_start", (_event, ctx) => {
+    const cache = loadModelsCache()
+    if (cache !== undefined) {
+      registerOpenRouterModels(pi, ctx, cache.models)
+    }
+
+    const cacheIsFresh =
+      cache !== undefined && Date.now() - cache.checkedAt < MODELS_CACHE_TTL_MS
+    if (!cacheIsFresh) {
+      void refreshModelsInBackground(pi, ctx)
+    }
   })
 
   pi.on("agent_settled", async (_event, ctx) => {
@@ -869,4 +1003,14 @@ export default function openRouterProvider(pi: ExtensionAPI) {
       )
     }
   })
+}
+
+export default function openRouterProvider(pi: ExtensionAPI) {
+  const selectedRoutes = loadSelectedRoutes()
+
+  registerProviderSelectionCommand(pi, selectedRoutes)
+  registerModelsCommand(pi)
+  registerRecentModelsCommand(pi)
+  registerModelTrackingHandlers(pi)
+  registerCatalogHandlers(pi, selectedRoutes)
 }
