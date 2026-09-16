@@ -8,8 +8,15 @@ import type {
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent"
 
+interface OpenRouterProviderResponse {
+  provider_name?: string
+  status?: number
+}
+
 interface OpenRouterGenerationData {
   provider_name?: string
+  /** Providers OpenRouter tried, in order, ending with the one that served the request. */
+  provider_responses?: OpenRouterProviderResponse[]
   total_cost?: number | null
   /** Number of tokens in the completion. */
   tokens_completion?: number | null
@@ -96,6 +103,7 @@ let generationCostTotal = 0
 let lastTurnCost: number | undefined
 let lastTurnTps: number | undefined
 let lastProviderName: string | undefined
+let lastFallbackProviders: string[] = []
 
 function normalizeModelId(modelId: string): string {
   return modelId.replace(/:(?:nitro|floor|exacto)$/u, "")
@@ -161,6 +169,26 @@ async function fetchGeneration(
   return await request
 }
 
+function fallbackProviders(
+  data: OpenRouterGenerationData | undefined
+): string[] {
+  const winner = data?.provider_name
+  const responses = data?.provider_responses
+  if (winner === undefined || responses === undefined) {
+    return []
+  }
+
+  const names: string[] = []
+  for (const response of responses) {
+    const name = response.provider_name
+    if (name === undefined || name === winner || names.includes(name)) {
+      continue
+    }
+    names.push(name)
+  }
+  return names
+}
+
 function renderOpenRouterStatus(ctx: ExtensionContext): void {
   if (lastTurnCost === undefined) {
     return
@@ -173,7 +201,11 @@ function renderOpenRouterStatus(ctx: ExtensionContext): void {
     parts.push(`${lastTurnTps.toFixed(1)} t/s`)
   }
   if (lastProviderName !== undefined) {
-    parts.push(lastProviderName)
+    const fallback =
+      lastFallbackProviders.length > 0
+        ? ` (fb: ${lastFallbackProviders.join(", ")})`
+        : ""
+    parts.push(`${lastProviderName}${fallback}`)
   }
   ctx.ui.setStatus("openrouter-provider", `OpenRouter: ${parts.join(", ")}`)
 }
@@ -199,6 +231,7 @@ function recordGenerationCost(
   if (data?.provider_name !== undefined) {
     lastProviderName = data.provider_name
   }
+  lastFallbackProviders = fallbackProviders(data)
   renderOpenRouterStatus(ctx)
 }
 
@@ -507,6 +540,7 @@ export default function openRouterProvider(pi: ExtensionAPI) {
     lastTurnCost = undefined
     lastTurnTps = undefined
     lastProviderName = undefined
+    lastFallbackProviders = []
 
     const routeOrder =
       ctx.model?.provider === "openrouter"
