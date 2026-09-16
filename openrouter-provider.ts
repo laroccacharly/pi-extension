@@ -5,6 +5,7 @@ import { join } from "node:path"
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent"
 
 interface OpenRouterGenerationData {
@@ -31,8 +32,54 @@ interface OpenRouterEndpointsResponse {
   }
 }
 
+interface OpenRouterModelArchitecture {
+  input_modalities?: string[]
+  output_modalities?: string[]
+}
+
+interface OpenRouterModelPricing {
+  prompt?: string
+  completion?: string
+  input_cache_read?: string
+  input_cache_write?: string
+}
+
+interface OpenRouterModelTopProvider {
+  context_length?: number
+  max_completion_tokens?: number
+}
+
+interface OpenRouterModel {
+  id: string
+  name?: string
+  created?: number
+  context_length?: number
+  architecture?: OpenRouterModelArchitecture
+  pricing?: OpenRouterModelPricing
+  top_provider?: OpenRouterModelTopProvider
+  supported_parameters?: string[]
+}
+
+interface OpenRouterModelsResponse {
+  data?: OpenRouterModel[]
+}
+
+interface OpenRouterModelsCache {
+  checkedAt: number
+  models: OpenRouterModel[]
+}
+
 const RETRY_DELAYS_MS = [0, 250, 750, 1500, 3000, 5000] as const
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-provider.json")
+const MODELS_CACHE_PATH = join(
+  homedir(),
+  ".pi",
+  "agent",
+  "openrouter-models-cache.json"
+)
+const MODELS_CACHE_TTL_MS = 30 * 60 * 1000
+const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+const RECENT_MODELS_LIMIT = 10
 
 /** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
 const generationCosts = new Map<string, number>()
@@ -177,6 +224,155 @@ function saveSelectedRoutes(routes: Map<string, string[]>): void {
   renameSync(temporaryPath, CONFIG_PATH)
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function isOpenRouterModel(value: unknown): value is OpenRouterModel {
+  return isRecord(value) && typeof value.id === "string"
+}
+
+function isChatModel(model: OpenRouterModel): boolean {
+  const outputs = model.architecture?.output_modalities
+  return outputs === undefined || outputs.includes("text")
+}
+
+function priceToPerMillion(value: string | undefined): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed * 1_000_000 : 0
+}
+
+/** Map a live OpenRouter catalog entry to a Pi model definition. */
+function toInputModalities(model: OpenRouterModel): ("text" | "image")[] {
+  const modalities = model.architecture?.input_modalities ?? []
+  const input = modalities.filter(
+    (modality): modality is "text" | "image" =>
+      modality === "text" || modality === "image"
+  )
+  return input.length > 0 ? input : ["text"]
+}
+
+function toModelCost(
+  pricing: OpenRouterModelPricing | undefined
+): ProviderModelConfig["cost"] {
+  return {
+    input: priceToPerMillion(pricing?.prompt),
+    output: priceToPerMillion(pricing?.completion),
+    cacheRead: priceToPerMillion(pricing?.input_cache_read),
+    cacheWrite: priceToPerMillion(pricing?.input_cache_write),
+  }
+}
+
+function supportsReasoning(model: OpenRouterModel): boolean {
+  const parameters = model.supported_parameters ?? []
+  return (
+    parameters.includes("reasoning") || parameters.includes("include_reasoning")
+  )
+}
+
+function toProviderModel(model: OpenRouterModel): ProviderModelConfig {
+  const reasoning = supportsReasoning(model)
+  const contextWindow =
+    model.context_length ?? model.top_provider?.context_length ?? 128_000
+  const maxTokens =
+    model.top_provider?.max_completion_tokens ?? Math.min(contextWindow, 16_384)
+
+  return {
+    id: model.id,
+    name: model.name ?? model.id,
+    api: "openai-completions",
+    reasoning,
+    input: toInputModalities(model),
+    cost: toModelCost(model.pricing),
+    contextWindow,
+    maxTokens,
+    compat: {
+      supportsDeveloperRole: false,
+      ...(reasoning ? { thinkingFormat: "openrouter" as const } : {}),
+    },
+  }
+}
+
+function loadModelsCache(): OpenRouterModelsCache | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf-8"))
+    if (!isRecord(parsed) || !Array.isArray(parsed.models)) {
+      return undefined
+    }
+    const models = parsed.models.filter(isOpenRouterModel)
+    if (models.length === 0) {
+      return undefined
+    }
+    return {
+      checkedAt: typeof parsed.checkedAt === "number" ? parsed.checkedAt : 0,
+      models,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function saveModelsCache(models: OpenRouterModel[]): void {
+  try {
+    const temporaryPath = `${MODELS_CACHE_PATH}.${process.pid}.tmp`
+    writeFileSync(
+      temporaryPath,
+      `${JSON.stringify({ checkedAt: Date.now(), models }, null, 2)}\n`,
+      { mode: 0o600 }
+    )
+    renameSync(temporaryPath, MODELS_CACHE_PATH)
+  } catch {
+    // Cache persistence is best effort.
+  }
+}
+
+async function fetchOpenRouterModels(
+  ctx: ExtensionContext
+): Promise<OpenRouterModel[]> {
+  let headers: Headers | undefined
+  try {
+    headers = await getOpenRouterHeaders(ctx)
+  } catch {
+    // The models catalog is public; proceed without auth headers.
+  }
+  const response = await fetch(OPENROUTER_MODELS_URL, { headers })
+  if (!response.ok) {
+    throw new Error(`OpenRouter returned HTTP ${response.status}`)
+  }
+  const result = (await response.json()) as OpenRouterModelsResponse
+  return (result.data ?? []).filter(isChatModel)
+}
+
+/**
+ * Re-register the OpenRouter provider with its built-in models plus any live
+ * models Pi's static catalog does not know about yet (for example stealth
+ * releases such as `stealth/union-alpha`). Returns how many were new.
+ */
+function registerOpenRouterModels(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  liveModels: OpenRouterModel[]
+): number {
+  const merged = new Map<string, ProviderModelConfig>()
+  for (const model of ctx.modelRegistry.getAll()) {
+    if (model.provider === "openrouter") {
+      merged.set(model.id, model)
+    }
+  }
+
+  let added = 0
+  for (const model of liveModels) {
+    if (merged.has(model.id)) {
+      continue
+    }
+    merged.set(model.id, toProviderModel(model))
+    added += 1
+  }
+
+  pi.registerProvider("openrouter", { models: [...merged.values()] })
+  return added
+}
+
 export default function openRouterProvider(pi: ExtensionAPI) {
   const selectedRoutes = loadSelectedRoutes()
 
@@ -307,6 +503,95 @@ export default function openRouterProvider(pi: ExtensionAPI) {
         ? undefined
         : `OpenRouter: preferring ${preferredProvider}`
     )
+  })
+
+  pi.registerCommand("openrouter-models", {
+    description: "Fetch the latest OpenRouter models and select one",
+    handler: async (_args, ctx) => {
+      try {
+        const liveModels = await fetchOpenRouterModels(ctx)
+        if (liveModels.length === 0) {
+          ctx.ui.notify("OpenRouter returned no chat models", "warning")
+          return
+        }
+
+        saveModelsCache(liveModels)
+        const priorIds = new Set(
+          ctx.modelRegistry
+            .getAll()
+            .filter((model) => model.provider === "openrouter")
+            .map((model) => model.id)
+        )
+        const added = registerOpenRouterModels(pi, ctx, liveModels)
+        const recent = liveModels
+          .toSorted((left, right) => (right.created ?? 0) - (left.created ?? 0))
+          .slice(0, RECENT_MODELS_LIMIT)
+        const options = recent.map((model) => {
+          const badge = priorIds.has(model.id) ? "" : " [new]"
+          return `${model.name ?? model.id}${badge} — ${model.id}`
+        })
+
+        const selection = await ctx.ui.select(
+          `OpenRouter models (${added} new of ${liveModels.length})`,
+          options
+        )
+        if (selection === undefined) {
+          return
+        }
+
+        const chosen = recent[options.indexOf(selection)]
+        if (chosen === undefined) {
+          return
+        }
+
+        const model = ctx.modelRegistry.find("openrouter", chosen.id)
+        if (model === undefined) {
+          ctx.ui.notify(`Could not resolve ${chosen.id}`, "error")
+          return
+        }
+
+        const selected = await pi.setModel(model)
+        if (!selected) {
+          ctx.ui.notify(
+            "OpenRouter authentication is not configured",
+            "warning"
+          )
+          return
+        }
+        ctx.ui.notify(`Using ${chosen.name ?? chosen.id}`, "info")
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error"
+        )
+      }
+    },
+  })
+
+  pi.on("session_start", (_event, ctx) => {
+    const cache = loadModelsCache()
+    if (cache !== undefined) {
+      registerOpenRouterModels(pi, ctx, cache.models)
+    }
+
+    const cacheIsFresh =
+      cache !== undefined && Date.now() - cache.checkedAt < MODELS_CACHE_TTL_MS
+    if (cacheIsFresh) {
+      return
+    }
+
+    void (async () => {
+      try {
+        const liveModels = await fetchOpenRouterModels(ctx)
+        if (liveModels.length === 0) {
+          return
+        }
+        saveModelsCache(liveModels)
+        registerOpenRouterModels(pi, ctx, liveModels)
+      } catch {
+        // Keep the cached catalog when OpenRouter is unreachable.
+      }
+    })()
   })
 
   pi.on("before_provider_request", (event, ctx) => {

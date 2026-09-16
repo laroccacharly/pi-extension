@@ -8,6 +8,18 @@ Pi prices OpenRouter tokens from the static model catalog, which ignores OpenRou
 
 The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one persists a preferred provider order with fallbacks in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override.
 
+## Latest models from the live API
+
+Pi resolves OpenRouter models from a static catalog, so brand-new and stealth releases (for example `stealth/union-alpha`) can be missing from `/model` until Pi ships an updated catalog. The extension bridges that gap by reading OpenRouter's live `GET /api/v1/models` catalog and merging any unknown chat models on top of Pi's built-in OpenRouter models.
+
+- On every session start the extension registers cached live models immediately, then refreshes the catalog in the background (network only when the cache is older than 30 minutes). Newly released models then show up in `/model`.
+- `/openrouter-models` fetches the catalog on demand, registers the merged model list, and shows the 10 most recently released models so you can pick one directly. Models that were not previously known are tagged `[new]`.
+- Discovered models are cached in `~/.pi/agent/openrouter-models-cache.json` so the list survives restarts and offline sessions.
+
+Live models are mapped from OpenRouter metadata (context length, max completion tokens, pricing, input modalities, and reasoning support) and default to the `openai-completions` API. Pi's built-in definitions are preserved as-is, so hand-tuned compatibility settings are not lost.
+
+> Note: `pi --list-models` runs before a session starts, so it only shows the static catalog plus whatever was already cached. The models are fully available in `/model` and `/openrouter-models` during a session.
+
 ## Install globally
 
 ```bash
