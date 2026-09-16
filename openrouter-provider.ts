@@ -7,10 +7,13 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent"
 
+interface OpenRouterGenerationData {
+  provider_name?: string
+  total_cost?: number | null
+}
+
 interface OpenRouterGenerationResponse {
-  data?: {
-    provider_name?: string
-  }
+  data?: OpenRouterGenerationData
 }
 
 interface OpenRouterEndpoint {
@@ -30,6 +33,17 @@ interface OpenRouterEndpointsResponse {
 
 const RETRY_DELAYS_MS = [0, 250, 750, 1500, 3000, 5000] as const
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-provider.json")
+
+/** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
+const generationCosts = new Map<string, number>()
+/** Shared in-flight generation lookups so message_end and agent_settled reuse one request. */
+const generationRequests = new Map<
+  string,
+  Promise<OpenRouterGenerationData | undefined>
+>()
+let generationCostTotal = 0
+let lastTurnCost: number | undefined
+let lastProviderName: string | undefined
 
 function normalizeModelId(modelId: string): string {
   return modelId.replace(/:(?:nitro|floor|exacto)$/u, "")
@@ -51,6 +65,79 @@ async function getOpenRouterHeaders(ctx: ExtensionContext): Promise<Headers> {
     headers.set("authorization", `Bearer ${auth.auth.apiKey}`)
   }
   return headers
+}
+
+async function fetchGeneration(
+  generationId: string,
+  ctx: ExtensionContext
+): Promise<OpenRouterGenerationData | undefined> {
+  const existing = generationRequests.get(generationId)
+  if (existing !== undefined) {
+    return await existing
+  }
+
+  const request = (async (): Promise<OpenRouterGenerationData | undefined> => {
+    try {
+      const url = new URL("https://openrouter.ai/api/v1/generation")
+      url.searchParams.set("id", generationId)
+      const headers = await getOpenRouterHeaders(ctx)
+
+      for (const [index, delayMs] of RETRY_DELAYS_MS.entries()) {
+        if (delayMs > 0) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, delayMs)
+          })
+        }
+
+        const response = await fetch(url, { headers })
+        if (response.status === 404 && index < RETRY_DELAYS_MS.length - 1) {
+          continue
+        }
+        if (!response.ok) {
+          throw new Error(`OpenRouter returned HTTP ${response.status}`)
+        }
+
+        const result = (await response.json()) as OpenRouterGenerationResponse
+        return result.data
+      }
+    } catch {
+      // Fall through and let the caller treat this generation as unresolved.
+    }
+  })()
+
+  generationRequests.set(generationId, request)
+  return await request
+}
+
+function renderOpenRouterStatus(ctx: ExtensionContext): void {
+  if (lastTurnCost === undefined) {
+    return
+  }
+  const parts = [
+    `($${lastTurnCost.toFixed(4)})`,
+    `$${generationCostTotal.toFixed(4)}`,
+  ]
+  if (lastProviderName !== undefined) {
+    parts.push(lastProviderName)
+  }
+  ctx.ui.setStatus("openrouter-provider", `OpenRouter: ${parts.join(", ")}`)
+}
+
+function recordGenerationCost(
+  generationId: string,
+  data: OpenRouterGenerationData | undefined,
+  ctx: ExtensionContext
+): void {
+  if (data !== undefined && !generationCosts.has(generationId)) {
+    const cost = data.total_cost ?? 0
+    generationCosts.set(generationId, cost)
+    generationCostTotal += cost
+    lastTurnCost = cost
+  }
+  if (data?.provider_name !== undefined) {
+    lastProviderName = data.provider_name
+  }
+  renderOpenRouterStatus(ctx)
 }
 
 function loadSelectedRoutes(): Map<string, string[]> {
@@ -203,6 +290,12 @@ export default function openRouterProvider(pi: ExtensionAPI) {
   })
 
   pi.on("session_start", (_event, ctx) => {
+    generationCosts.clear()
+    generationRequests.clear()
+    generationCostTotal = 0
+    lastTurnCost = undefined
+    lastProviderName = undefined
+
     const routeOrder =
       ctx.model?.provider === "openrouter"
         ? selectedRoutes.get(normalizeModelId(ctx.model.id))
@@ -259,6 +352,21 @@ export default function openRouterProvider(pi: ExtensionAPI) {
     }
   })
 
+  pi.on("message_end", (event, ctx) => {
+    const { message } = event
+    if (message.role !== "assistant" || message.provider !== "openrouter") {
+      return
+    }
+    const generationId = message.responseId
+    if (generationId === undefined) {
+      return
+    }
+    void (async () => {
+      const data = await fetchGeneration(generationId, ctx)
+      recordGenerationCost(generationId, data, ctx)
+    })()
+  })
+
   pi.on("agent_settled", async (_event, ctx) => {
     const entry = ctx.sessionManager
       .getBranch()
@@ -288,38 +396,14 @@ export default function openRouterProvider(pi: ExtensionAPI) {
       return
     }
 
-    ctx.ui.setStatus("openrouter-provider", "OpenRouter: resolving provider…")
+    if (lastTurnCost === undefined) {
+      ctx.ui.setStatus("openrouter-provider", "OpenRouter: resolving provider…")
+    }
 
-    try {
-      const url = new URL("https://openrouter.ai/api/v1/generation")
-      url.searchParams.set("id", generationId)
-      const headers = await getOpenRouterHeaders(ctx)
+    const data = await fetchGeneration(generationId, ctx)
+    recordGenerationCost(generationId, data, ctx)
 
-      for (const [index, delayMs] of RETRY_DELAYS_MS.entries()) {
-        if (delayMs > 0) {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, delayMs)
-          })
-        }
-
-        const response = await fetch(url, { headers })
-        if (response.status === 404 && index < RETRY_DELAYS_MS.length - 1) {
-          continue
-        }
-        if (!response.ok) {
-          throw new Error(`OpenRouter returned HTTP ${response.status}`)
-        }
-
-        const result = (await response.json()) as OpenRouterGenerationResponse
-        const providerName = result.data?.provider_name
-        if (providerName === undefined) {
-          throw new Error("OpenRouter did not return a provider name")
-        }
-
-        ctx.ui.setStatus("openrouter-provider", `OpenRouter: ${providerName}`)
-        return
-      }
-    } catch {
+    if (data?.provider_name === undefined && lastTurnCost === undefined) {
       ctx.ui.setStatus(
         "openrouter-provider",
         "OpenRouter: provider unavailable"
