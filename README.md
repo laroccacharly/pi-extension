@@ -20,6 +20,12 @@ Live models are mapped from OpenRouter metadata (context length, max completion 
 
 > Note: `pi --list-models` runs before a session starts, so it only shows the static catalog plus whatever was already cached. The models are fully available in `/model` and `/openrouter-models` during a session.
 
+## Recently used models
+
+The extension tracks the last five models you selected or used, most recent first, in `~/.pi/agent/last-models.json`. Every `model_select` and every assistant response moves the model to the front of the list, so switching with `/model`, cycling models, and simply chatting all count. The list is capped at five and de-duplicated by `provider/id`.
+
+`/last-models` shows that list as a selector. Picking an entry switches the session to it (via the same resolution path as `/model`). When nothing has been used yet the command reports that the list is empty.
+
 ## Install globally
 
 ```bash

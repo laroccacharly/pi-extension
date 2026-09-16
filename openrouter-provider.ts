@@ -80,6 +80,13 @@ interface OpenRouterModelsCache {
   models: OpenRouterModel[]
 }
 
+interface RecentModelEntry {
+  provider: string
+  id: string
+  name: string
+  lastUsedAt: number
+}
+
 const RETRY_DELAYS_MS = [0, 250, 750, 1500, 3000, 5000] as const
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-provider.json")
 const MODELS_CACHE_PATH = join(
@@ -91,6 +98,8 @@ const MODELS_CACHE_PATH = join(
 const MODELS_CACHE_TTL_MS = 30 * 60 * 1000
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 const RECENT_MODELS_LIMIT = 10
+const LAST_MODELS_PATH = join(homedir(), ".pi", "agent", "last-models.json")
+const LAST_MODELS_LIMIT = 5
 
 /** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
 const generationCosts = new Map<string, number>()
@@ -374,6 +383,63 @@ function saveModelsCache(models: OpenRouterModel[]): void {
   }
 }
 
+function isRecentModelEntry(value: unknown): value is RecentModelEntry {
+  return (
+    isRecord(value) &&
+    typeof value.provider === "string" &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.lastUsedAt === "number"
+  )
+}
+
+function findRegisteredModel(
+  ctx: ExtensionContext,
+  provider: string,
+  id: string
+) {
+  return ctx.modelRegistry
+    .getAll()
+    .find((model) => model.provider === provider && model.id === id)
+}
+
+function loadRecentModels(): RecentModelEntry[] {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(LAST_MODELS_PATH, "utf-8"))
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+    return parsed.filter(isRecentModelEntry).slice(0, LAST_MODELS_LIMIT)
+  } catch {
+    return []
+  }
+}
+
+function saveRecentModels(models: RecentModelEntry[]): void {
+  try {
+    const temporaryPath = `${LAST_MODELS_PATH}.${process.pid}.tmp`
+    writeFileSync(temporaryPath, `${JSON.stringify(models, null, 2)}\n`, {
+      mode: 0o600,
+    })
+    renameSync(temporaryPath, LAST_MODELS_PATH)
+  } catch {
+    // Recent-model persistence is best effort.
+  }
+}
+
+/** Move a model to the front of the recency list, keeping only the last five. */
+function recordModelUse(provider: string, id: string, name: string): void {
+  const others = loadRecentModels().filter(
+    (entry) => entry.provider !== provider || entry.id !== id
+  )
+  saveRecentModels(
+    [{ provider, id, name, lastUsedAt: Date.now() }, ...others].slice(
+      0,
+      LAST_MODELS_LIMIT
+    )
+  )
+}
+
 async function fetchOpenRouterModels(
   ctx: ExtensionContext
 ): Promise<OpenRouterModel[]> {
@@ -616,6 +682,64 @@ export default function openRouterProvider(pi: ExtensionAPI) {
         )
       }
     },
+  })
+
+  pi.registerCommand("last-models", {
+    description: "Switch to one of the five most recently used models",
+    handler: async (_args, ctx) => {
+      const recent = loadRecentModels()
+      if (recent.length === 0) {
+        ctx.ui.notify("No models used yet", "info")
+        return
+      }
+
+      const options = recent.map(
+        (entry) => `${entry.name} — ${entry.provider}/${entry.id}`
+      )
+      const selection = await ctx.ui.select("Recently used models", options)
+      if (selection === undefined) {
+        return
+      }
+
+      const chosen = recent[options.indexOf(selection)]
+      if (chosen === undefined) {
+        return
+      }
+
+      const model = findRegisteredModel(ctx, chosen.provider, chosen.id)
+      if (model === undefined) {
+        ctx.ui.notify(
+          `Could not resolve ${chosen.provider}/${chosen.id}`,
+          "error"
+        )
+        return
+      }
+
+      const selected = await pi.setModel(model)
+      if (!selected) {
+        ctx.ui.notify(
+          "Authentication is not configured for this model",
+          "warning"
+        )
+        return
+      }
+      ctx.ui.notify(`Using ${model.name}`, "info")
+    },
+  })
+
+  pi.on("model_select", (event) => {
+    recordModelUse(event.model.provider, event.model.id, event.model.name)
+  })
+
+  pi.on("message_end", (event, ctx) => {
+    const { message } = event
+    if (message.role !== "assistant") {
+      return
+    }
+    const name =
+      findRegisteredModel(ctx, message.provider, message.model)?.name ??
+      message.model
+    recordModelUse(message.provider, message.model, name)
   })
 
   pi.on("session_start", (_event, ctx) => {
