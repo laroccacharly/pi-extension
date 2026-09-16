@@ -614,9 +614,11 @@ export default function openRouterProvider(pi: ExtensionAPI) {
     if (ctx.model?.provider !== "openrouter") {
       return
     }
-    const routeOrder = selectedRoutes.get(normalizeModelId(ctx.model.id))
+    const preferredProvider = selectedRoutes
+      .get(normalizeModelId(ctx.model.id))
+      ?.at(0)
     if (
-      routeOrder === undefined ||
+      preferredProvider === undefined ||
       event.payload === null ||
       event.payload === undefined ||
       typeof event.payload !== "object" ||
@@ -633,13 +635,14 @@ export default function openRouterProvider(pi: ExtensionAPI) {
       !Array.isArray(payload.provider)
         ? { ...(payload.provider as Record<string, unknown>) }
         : {}
-    delete provider.only
-    provider.sort = "price"
-    provider.order = routeOrder
-    provider.allow_fallbacks = true
+    // Never sort by price and never fall back to another provider: pin the
+    // selected endpoint as the only allowed one so OpenRouter cannot rerank.
+    delete provider.sort
+    delete provider.order
+    provider.only = [preferredProvider]
+    provider.allow_fallbacks = false
     return {
       ...payload,
-      model: `${normalizeModelId(ctx.model.id)}:floor`,
       provider,
     }
   })

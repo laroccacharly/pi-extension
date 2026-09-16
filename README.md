@@ -6,7 +6,7 @@ Pi extension that displays the OpenRouter upstream provider used for each respon
 
 Pi prices OpenRouter tokens from the static model catalog, which ignores OpenRouter's per-request cost (routing, time-of-day price overrides, fees). After each assistant response the extension fetches `GET /api/v1/generation?id=<responseId>` and reads the returned `total_cost`, `tokens_completion`, and `generation_time`. The footer status shows `OpenRouter: ($lastTurn), $sessionTotal, tokensPerSecond, providerName`, i.e. last response cost, cumulative session cost, the actual generation speed in tokens per second (`tokens_completion / (generation_time / 1000)`), and upstream provider. This is OpenRouter's authoritative billed cost, so it can differ from the estimate in Pi's built-in cost display. The totals reset when a new session starts.
 
-The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one persists a preferred provider order with fallbacks in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override.
+The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one pins that provider as the only allowed endpoint (no fallbacks) in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override and lets OpenRouter route normally.
 
 ## Latest models from the live API
 
@@ -41,4 +41,4 @@ Linting uses Oxlint with Ultracite's core rules. Formatting uses Oxfmt with Ultr
 
 ## Known routing behavior
 
-OpenRouter may rerank complex tool-enabled requests despite an explicit provider order. The extension sends the selected provider first with fallbacks enabled, but strict first-provider enforcement would require client-side retries using one provider per attempt.
+When a provider is selected, the extension sends `provider.only` with the chosen endpoint and `allow_fallbacks: false`, and it never forces price-based sorting or the `:floor` model variant. Requests are therefore pinned to that provider (or fail) instead of being reranked by OpenRouter. Auto-route leaves routing entirely to OpenRouter and Pi's configured sort order.
