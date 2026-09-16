@@ -202,10 +202,7 @@ function renderOpenRouterStatus(ctx: ExtensionContext): void {
   if (lastTurnCost === undefined) {
     return
   }
-  const parts = [
-    `($${lastTurnCost.toFixed(4)})`,
-    `$${generationCostTotal.toFixed(4)}`,
-  ]
+  const parts = [`$${generationCostTotal.toFixed(4)}`]
   if (lastTurnTps !== undefined) {
     parts.push(`${lastTurnTps.toFixed(1)} t/s`)
   }
