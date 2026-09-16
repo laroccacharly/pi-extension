@@ -86,6 +86,22 @@ const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 const RECENT_MODELS_LIMIT = 10
 const LAST_MODELS_PATH = join(homedir(), ".pi", "agent", "last-models.json")
 const LAST_MODELS_LIMIT = 5
+const SORT_CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-sort.json")
+
+type SortBy = "throughput" | "price" | "latency"
+
+interface SortOption {
+  label: string
+  by: SortBy | undefined
+}
+
+const DEFAULT_SORT_BY: SortBy = "throughput"
+const SORT_OPTIONS: SortOption[] = [
+  { label: "Throughput — fastest output", by: "throughput" },
+  { label: "Price — cheapest provider", by: "price" },
+  { label: "Latency — fastest time to first token", by: "latency" },
+  { label: "OpenRouter default — no sort override", by: undefined },
+]
 
 /** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
 const generationCosts = new Map<string, number>()
@@ -101,6 +117,8 @@ let lastTurnCost: number | undefined
 let lastTurnTps: number | undefined
 let lastProviderName: string | undefined
 let lastFallbackProviders: string[] = []
+/** Sort applied to auto-routed OpenRouter requests. Undefined means OpenRouter's default. */
+let selectedSortBy: SortBy | undefined = DEFAULT_SORT_BY
 
 function normalizeModelId(modelId: string): string {
   return modelId.replace(/:(?:nitro|floor|exacto)$/u, "")
@@ -343,6 +361,35 @@ function loadSelectedRoutes(): Map<string, string[]> {
 
 function saveSelectedRoutes(routes: Map<string, string[]>): void {
   writeJsonFile(CONFIG_PATH, Object.fromEntries(routes))
+}
+
+function loadSelectedSort(): SortBy | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(SORT_CONFIG_PATH, "utf-8"))
+    if (!isRecord(parsed)) {
+      return DEFAULT_SORT_BY
+    }
+    const { by } = parsed
+    if (by === null) {
+      return undefined
+    }
+    if (by === "throughput" || by === "price" || by === "latency") {
+      return by
+    }
+    return DEFAULT_SORT_BY
+  } catch {
+    return DEFAULT_SORT_BY
+  }
+}
+
+function saveSelectedSort(by: SortBy | undefined): void {
+  writeJsonFile(SORT_CONFIG_PATH, { by: by ?? null })
+}
+
+function autoRouteStatus(): string {
+  return selectedSortBy === undefined
+    ? "OpenRouter: auto-routing (OpenRouter default)"
+    : `OpenRouter: auto-routing by ${selectedSortBy}`
 }
 
 function isOpenRouterModel(value: unknown): value is OpenRouterModel {
@@ -708,10 +755,7 @@ function registerProviderSelectionCommand(
         if (choice.kind === "auto") {
           selectedRoutes.delete(modelId)
           saveSelectedRoutes(selectedRoutes)
-          ctx.ui.setStatus(
-            "openrouter-provider",
-            "OpenRouter: auto-routing by throughput"
-          )
+          ctx.ui.setStatus("openrouter-provider", autoRouteStatus())
           return
         }
 
@@ -736,6 +780,30 @@ function registerProviderSelectionCommand(
           "error"
         )
       }
+    },
+  })
+}
+
+function registerSortCommand(pi: ExtensionAPI): void {
+  pi.registerCommand("openrouter-sort", {
+    description:
+      "Choose how auto-routed OpenRouter requests are sorted (throughput, price, or latency)",
+    handler: async (_args, ctx) => {
+      const options = SORT_OPTIONS.map((option) => option.label)
+      const selection = await ctx.ui.select(
+        "OpenRouter sort for auto-routed requests",
+        options
+      )
+      if (selection === undefined) {
+        return
+      }
+      const option = SORT_OPTIONS[options.indexOf(selection)]
+      if (option === undefined) {
+        return
+      }
+      selectedSortBy = option.by
+      saveSelectedSort(selectedSortBy)
+      ctx.ui.notify(`OpenRouter sort: ${option.label}`, "info")
     },
   })
 }
@@ -868,34 +936,42 @@ function registerSessionStatusHandlers(
         ? selectedRoutes.get(normalizeModelId(ctx.model.id))
         : undefined
     const preferredProvider = routeOrder?.[0]
-    ctx.ui.setStatus(
-      "openrouter-provider",
-      preferredProvider === undefined
-        ? undefined
-        : `OpenRouter: preferring ${preferredProvider}`
-    )
+    let status: string | undefined
+    if (ctx.model?.provider === "openrouter") {
+      status =
+        preferredProvider === undefined
+          ? autoRouteStatus()
+          : `OpenRouter: preferring ${preferredProvider}`
+    }
+    ctx.ui.setStatus("openrouter-provider", status)
   })
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== "openrouter") {
-      return
-    }
-    const preferredProvider = selectedRoutes
-      .get(normalizeModelId(ctx.model.id))
-      ?.at(0)
-    if (preferredProvider === undefined || !isRecord(event.payload)) {
+    if (ctx.model?.provider !== "openrouter" || !isRecord(event.payload)) {
       return
     }
 
+    const routeOrder = selectedRoutes.get(normalizeModelId(ctx.model.id))
     const provider = isRecord(event.payload.provider)
       ? { ...event.payload.provider }
       : {}
-    // Never sort by price and never fall back to another provider: pin the
-    // selected endpoint as the only allowed one so OpenRouter cannot rerank.
-    delete provider.sort
-    delete provider.order
-    provider.only = [preferredProvider]
-    provider.allow_fallbacks = false
+
+    const preferredProvider = routeOrder?.at(0)
+    if (preferredProvider !== undefined) {
+      // Never sort by price and never fall back to another provider: pin the
+      // selected endpoint as the only allowed one so OpenRouter cannot rerank.
+      delete provider.sort
+      delete provider.order
+      provider.only = [preferredProvider]
+      provider.allow_fallbacks = false
+    } else if (selectedSortBy === undefined) {
+      // "OpenRouter default" explicitly clears any configured sort so the
+      // choice is authoritative even when models.json sets its own.
+      delete provider.sort
+    } else {
+      provider.sort = { by: selectedSortBy }
+    }
+
     return {
       ...event.payload,
       provider,
@@ -1007,8 +1083,10 @@ function registerCatalogHandlers(
 
 export default function openRouterProvider(pi: ExtensionAPI) {
   const selectedRoutes = loadSelectedRoutes()
+  selectedSortBy = loadSelectedSort()
 
   registerProviderSelectionCommand(pi, selectedRoutes)
+  registerSortCommand(pi)
   registerModelsCommand(pi)
   registerRecentModelsCommand(pi)
   registerModelTrackingHandlers(pi)

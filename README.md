@@ -8,6 +8,10 @@ Pi prices OpenRouter tokens from the static model catalog, which ignores OpenRou
 
 The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one pins that provider as the only allowed endpoint (no fallbacks) in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override and lets OpenRouter route normally.
 
+## Auto-route sort
+
+The `/openrouter-sort` command chooses how auto-routed requests are sorted: `throughput` (default), `price`, `latency`, or `OpenRouter default` to remove the sort override. The choice is stored globally in `~/.pi/agent/openrouter-sort.json` and applied to every auto-routed request by the extension itself, so it works without any `models.json` `openRouterRouting` configuration. Pinned providers ignore the sort and remain the only allowed endpoint.
+
 ## Latest models from the live API
 
 Pi resolves OpenRouter models from a static catalog, so brand-new and stealth releases (for example `stealth/union-alpha`) can be missing from `/model` until Pi ships an updated catalog. The extension bridges that gap by reading OpenRouter's live `GET /api/v1/models` catalog and merging any unknown chat models on top of Pi's built-in OpenRouter models.
@@ -47,4 +51,4 @@ Linting uses Oxlint with Ultracite's core rules. Formatting uses Oxfmt with Ultr
 
 ## Known routing behavior
 
-When a provider is selected, the extension sends `provider.only` with the chosen endpoint and `allow_fallbacks: false`, and it never forces price-based sorting or the `:floor` model variant. Requests are therefore pinned to that provider (or fail) instead of being reranked by OpenRouter. Auto-route leaves routing entirely to OpenRouter and Pi's configured sort order.
+When a provider is selected, the extension sends `provider.only` with the chosen endpoint and `allow_fallbacks: false`, and it never forces price-based sorting or the `:floor` model variant. Requests are therefore pinned to that provider (or fail) instead of being reranked by OpenRouter. Auto-route applies the sort selected with `/openrouter-sort` (throughput by default), overriding any `openRouterRouting.sort` configured in `models.json`.
