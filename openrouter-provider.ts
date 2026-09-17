@@ -392,6 +392,25 @@ function autoRouteStatus(): string {
     : `OpenRouter: auto-routing by ${selectedSortBy}`
 }
 
+function updateStatusForModel(
+  ctx: ExtensionContext,
+  selectedRoutes: Map<string, string[]>,
+  model: { provider: string; id: string }
+): void {
+  if (model.provider !== "openrouter") {
+    ctx.ui.setStatus("openrouter-provider", undefined)
+    return
+  }
+
+  const preferredProvider = selectedRoutes.get(normalizeModelId(model.id))?.[0]
+  ctx.ui.setStatus(
+    "openrouter-provider",
+    preferredProvider === undefined
+      ? autoRouteStatus()
+      : `OpenRouter: preferring ${preferredProvider}`
+  )
+}
+
 function isOpenRouterModel(value: unknown): value is OpenRouterModel {
   return isRecord(value) && typeof value.id === "string"
 }
@@ -931,19 +950,15 @@ function registerSessionStatusHandlers(
     lastProviderName = undefined
     lastFallbackProviders = []
 
-    const routeOrder =
-      ctx.model?.provider === "openrouter"
-        ? selectedRoutes.get(normalizeModelId(ctx.model.id))
-        : undefined
-    const preferredProvider = routeOrder?.[0]
-    let status: string | undefined
-    if (ctx.model?.provider === "openrouter") {
-      status =
-        preferredProvider === undefined
-          ? autoRouteStatus()
-          : `OpenRouter: preferring ${preferredProvider}`
+    if (ctx.model === undefined) {
+      ctx.ui.setStatus("openrouter-provider", undefined)
+      return
     }
-    ctx.ui.setStatus("openrouter-provider", status)
+    updateStatusForModel(ctx, selectedRoutes, ctx.model)
+  })
+
+  pi.on("model_select", (event, ctx) => {
+    updateStatusForModel(ctx, selectedRoutes, event.model)
   })
 
   pi.on("before_provider_request", (event, ctx) => {
