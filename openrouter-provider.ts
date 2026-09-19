@@ -103,20 +103,38 @@ const SORT_OPTIONS: SortOption[] = [
   { label: "OpenRouter default — no sort override", by: undefined },
 ]
 
-/** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
-const generationCosts = new Map<string, number>()
-/** Shared in-flight generation lookups so message_end and agent_settled reuse one request. */
-const generationRequests = new Map<
-  string,
-  Promise<OpenRouterGenerationData | undefined>
->()
-/** Resolved generation data, kept so repeated lookups do not re-request. */
-const resolvedGenerations = new Map<string, OpenRouterGenerationData>()
-let generationCostTotal = 0
-let lastTurnCost: number | undefined
-let lastTurnTps: number | undefined
-let lastProviderName: string | undefined
-let lastFallbackProviders: string[] = []
+interface GenerationState {
+  /** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
+  costs: Map<string, number>
+  /** Shared lookups so message_end and agent_settled reuse one request. */
+  requests: Map<string, Promise<OpenRouterGenerationData | undefined>>
+  /** Resolved generation data, kept so repeated lookups do not re-request. */
+  resolved: Map<string, OpenRouterGenerationData>
+  /** Background lookups that must settle before the final status is rendered. */
+  pendingRefreshes: Set<Promise<void>>
+  costTotal: number
+  lastTurnCost: number | undefined
+  lastTurnTps: number | undefined
+  lastProviderName: string | undefined
+  lastFallbackProviders: string[]
+}
+
+function createGenerationState(): GenerationState {
+  return {
+    costs: new Map(),
+    requests: new Map(),
+    resolved: new Map(),
+    pendingRefreshes: new Set(),
+    costTotal: 0,
+    lastTurnCost: undefined,
+    lastTurnTps: undefined,
+    lastProviderName: undefined,
+    lastFallbackProviders: [],
+  }
+}
+
+/** Replaced, rather than reset, whenever Pi starts a new session. */
+const generationState = { current: createGenerationState() }
 /** Sort applied to auto-routed OpenRouter requests. Undefined means OpenRouter's default. */
 let selectedSortBy: SortBy | undefined = DEFAULT_SORT_BY
 
@@ -210,15 +228,16 @@ function toEndpoint(value: unknown): OpenRouterEndpoint | undefined {
 }
 
 async function fetchGeneration(
+  state: GenerationState,
   generationId: string,
   ctx: ExtensionContext
 ): Promise<OpenRouterGenerationData | undefined> {
-  const resolved = resolvedGenerations.get(generationId)
+  const resolved = state.resolved.get(generationId)
   if (resolved !== undefined) {
     return resolved
   }
 
-  const existing = generationRequests.get(generationId)
+  const existing = state.requests.get(generationId)
   if (existing !== undefined) {
     return await existing
   }
@@ -252,15 +271,15 @@ async function fetchGeneration(
     }
   })()
 
-  generationRequests.set(generationId, request)
+  state.requests.set(generationId, request)
   try {
     const data = await request
     if (data !== undefined) {
-      resolvedGenerations.set(generationId, data)
+      state.resolved.set(generationId, data)
     }
     return data
   } finally {
-    generationRequests.delete(generationId)
+    state.requests.delete(generationId)
   }
 }
 
@@ -284,47 +303,49 @@ function fallbackProviders(
   return names
 }
 
-function renderOpenRouterStatus(ctx: ExtensionContext): void {
-  if (lastTurnCost === undefined) {
+function renderOpenRouterStatus(
+  state: GenerationState,
+  ctx: ExtensionContext
+): void {
+  if (state.lastTurnCost === undefined) {
     return
   }
-  const parts = [`$${generationCostTotal.toFixed(4)}`]
-  if (lastTurnTps !== undefined) {
-    parts.push(`${lastTurnTps.toFixed(1)} t/s`)
+  const parts = [`$${state.costTotal.toFixed(4)}`]
+  if (state.lastTurnTps !== undefined) {
+    parts.push(`${state.lastTurnTps.toFixed(1)} t/s`)
   }
-  if (lastProviderName !== undefined) {
+  if (state.lastProviderName !== undefined) {
     const fallback =
-      lastFallbackProviders.length > 0
-        ? ` (fb: ${lastFallbackProviders.join(", ")})`
+      state.lastFallbackProviders.length > 0
+        ? ` (fb: ${state.lastFallbackProviders.join(", ")})`
         : ""
-    parts.push(`${lastProviderName}${fallback}`)
+    parts.push(`${state.lastProviderName}${fallback}`)
   }
   ctx.ui.setStatus("openrouter-provider", `OpenRouter: ${parts.join(", ")}`)
 }
 
 function recordGenerationCost(
+  state: GenerationState,
   generationId: string,
-  data: OpenRouterGenerationData | undefined,
-  ctx: ExtensionContext
+  data: OpenRouterGenerationData | undefined
 ): void {
-  if (data !== undefined && !generationCosts.has(generationId)) {
+  if (data !== undefined && !state.costs.has(generationId)) {
     const cost = data.total_cost ?? 0
-    generationCosts.set(generationId, cost)
-    generationCostTotal += cost
-    lastTurnCost = cost
+    state.costs.set(generationId, cost)
+    state.costTotal += cost
+    state.lastTurnCost = cost
 
     const tokens = data.tokens_completion ?? 0
     const generationTimeMs = data.generation_time ?? 0
-    lastTurnTps =
+    state.lastTurnTps =
       tokens > 0 && generationTimeMs > 0
         ? tokens / (generationTimeMs / 1000)
         : undefined
   }
   if (data?.provider_name !== undefined) {
-    lastProviderName = data.provider_name
+    state.lastProviderName = data.provider_name
   }
-  lastFallbackProviders = fallbackProviders(data)
-  renderOpenRouterStatus(ctx)
+  state.lastFallbackProviders = fallbackProviders(data)
 }
 
 /** Replace a JSON file atomically, creating it with owner-only permissions. */
@@ -620,11 +641,21 @@ async function refreshModelsInBackground(
 }
 
 async function refreshGeneration(
+  state: GenerationState,
   generationId: string,
   ctx: ExtensionContext
 ): Promise<void> {
-  const data = await fetchGeneration(generationId, ctx)
-  recordGenerationCost(generationId, data, ctx)
+  const data = await fetchGeneration(state, generationId, ctx)
+  recordGenerationCost(state, generationId, data)
+}
+
+function queueGenerationRefresh(
+  state: GenerationState,
+  generationId: string,
+  ctx: ExtensionContext
+): void {
+  const refresh = refreshGeneration(state, generationId, ctx)
+  state.pendingRefreshes.add(refresh)
 }
 
 function formatModelOption(
@@ -941,14 +972,9 @@ function registerSessionStatusHandlers(
   selectedRoutes: Map<string, string[]>
 ): void {
   pi.on("session_start", (_event, ctx) => {
-    generationCosts.clear()
-    generationRequests.clear()
-    resolvedGenerations.clear()
-    generationCostTotal = 0
-    lastTurnCost = undefined
-    lastTurnTps = undefined
-    lastProviderName = undefined
-    lastFallbackProviders = []
+    // A replacement state prevents late work from the prior session from
+    // changing the new session's totals, even if its network request finishes.
+    generationState.current = createGenerationState()
 
     if (ctx.model === undefined) {
       ctx.ui.setStatus("openrouter-provider", undefined)
@@ -1028,8 +1054,62 @@ function registerModelTrackingHandlers(pi: ExtensionAPI): void {
     if (generationId === undefined) {
       return
     }
-    void refreshGeneration(generationId, ctx)
+    // Prefetch every generation so tool-call responses count toward the total.
+    // This task mutates only its captured session state and never touches UI.
+    queueGenerationRefresh(generationState.current, generationId, ctx)
   })
+}
+
+async function settleGenerationStatus(ctx: ExtensionContext): Promise<void> {
+  const state = generationState.current
+  const entry = ctx.sessionManager
+    .getBranch()
+    .findLast(
+      (candidate) =>
+        candidate.type === "message" && candidate.message.role === "assistant"
+    )
+  if (
+    !entry ||
+    entry.type !== "message" ||
+    entry.message.role !== "assistant"
+  ) {
+    return
+  }
+
+  if (entry.message.provider !== "openrouter") {
+    ctx.ui.setStatus("openrouter-provider", undefined)
+    return
+  }
+
+  const generationId = entry.message.responseId
+  if (generationId === undefined) {
+    ctx.ui.setStatus("openrouter-provider", "OpenRouter: provider unavailable")
+    return
+  }
+
+  if (state.lastTurnCost === undefined) {
+    ctx.ui.setStatus("openrouter-provider", "OpenRouter: resolving provider…")
+  }
+
+  queueGenerationRefresh(state, generationId, ctx)
+  await Promise.all(state.pendingRefreshes)
+  state.pendingRefreshes.clear()
+
+  // A session replacement can occur while OpenRouter is being queried. The
+  // old state may finish, but its old context must never update the new UI.
+  if (generationState.current !== state) {
+    return
+  }
+
+  if (
+    state.lastProviderName === undefined &&
+    state.lastTurnCost === undefined
+  ) {
+    ctx.ui.setStatus("openrouter-provider", "OpenRouter: provider unavailable")
+    return
+  }
+
+  renderOpenRouterStatus(state, ctx)
 }
 
 function registerCatalogHandlers(
@@ -1052,47 +1132,7 @@ function registerCatalogHandlers(
   })
 
   pi.on("agent_settled", async (_event, ctx) => {
-    const entry = ctx.sessionManager
-      .getBranch()
-      .findLast(
-        (candidate) =>
-          candidate.type === "message" && candidate.message.role === "assistant"
-      )
-    if (
-      !entry ||
-      entry.type !== "message" ||
-      entry.message.role !== "assistant"
-    ) {
-      return
-    }
-
-    if (entry.message.provider !== "openrouter") {
-      ctx.ui.setStatus("openrouter-provider", undefined)
-      return
-    }
-
-    const generationId = entry.message.responseId
-    if (generationId === undefined) {
-      ctx.ui.setStatus(
-        "openrouter-provider",
-        "OpenRouter: provider unavailable"
-      )
-      return
-    }
-
-    if (lastTurnCost === undefined) {
-      ctx.ui.setStatus("openrouter-provider", "OpenRouter: resolving provider…")
-    }
-
-    const data = await fetchGeneration(generationId, ctx)
-    recordGenerationCost(generationId, data, ctx)
-
-    if (data?.provider_name === undefined && lastTurnCost === undefined) {
-      ctx.ui.setStatus(
-        "openrouter-provider",
-        "OpenRouter: provider unavailable"
-      )
-    }
+    await settleGenerationStatus(ctx)
   })
 }
 
