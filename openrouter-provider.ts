@@ -346,7 +346,7 @@ function renderOpenRouterStatus(
         : ""
     parts.push(`${state.lastProviderName}${fallback}`)
   }
-  ctx.ui.setStatus("openrouter-provider", `OpenRouter: ${parts.join(", ")}`)
+  ctx.ui.setStatus("openrouter-provider", parts.join(", "))
 }
 
 /**
