@@ -22,6 +22,12 @@ interface OpenRouterGenerationData {
   tokens_completion?: number | null
   /** Time taken for generation in milliseconds. */
   generation_time?: number | null
+  /** Prompt tokens served from the provider's cache, or null when unsupported. */
+  native_tokens_cached?: number | undefined
+  /** Provider-native prompt tokens, the denominator for the cache hit rate. */
+  native_tokens_prompt?: number | undefined
+  /** USD discount OpenRouter applied because prompt tokens were cached. */
+  cache_discount?: number | undefined
 }
 
 interface OpenRouterEndpoint {
@@ -117,6 +123,12 @@ interface GenerationState {
   lastTurnTps: number | undefined
   lastProviderName: string | undefined
   lastFallbackProviders: string[]
+  /** Cumulative cached prompt tokens across resolved generations. */
+  cacheReadTokens: number
+  /** Cumulative provider-native prompt tokens across resolved generations. */
+  promptTokens: number
+  /** Cumulative USD discount from prompt caching. */
+  cacheDiscountTotal: number
 }
 
 function createGenerationState(): GenerationState {
@@ -130,6 +142,9 @@ function createGenerationState(): GenerationState {
     lastTurnTps: undefined,
     lastProviderName: undefined,
     lastFallbackProviders: [],
+    cacheReadTokens: 0,
+    promptTokens: 0,
+    cacheDiscountTotal: 0,
   }
 }
 
@@ -203,6 +218,9 @@ function toGenerationData(
     total_cost: readFiniteNumber(value.total_cost),
     tokens_completion: readFiniteNumber(value.tokens_completion),
     generation_time: readFiniteNumber(value.generation_time),
+    native_tokens_cached: readFiniteNumber(value.native_tokens_cached),
+    native_tokens_prompt: readFiniteNumber(value.native_tokens_prompt),
+    cache_discount: readFiniteNumber(value.cache_discount),
   }
 }
 
@@ -314,6 +332,13 @@ function renderOpenRouterStatus(
   if (state.lastTurnTps !== undefined) {
     parts.push(`${state.lastTurnTps.toFixed(1)} t/s`)
   }
+  if (state.promptTokens > 0) {
+    const hitRate = (state.cacheReadTokens / state.promptTokens) * 100
+    parts.push(`cache ${Math.round(hitRate)}%`)
+  }
+  if (state.cacheDiscountTotal > 0) {
+    parts.push(`saved $${state.cacheDiscountTotal.toFixed(4)}`)
+  }
   if (state.lastProviderName !== undefined) {
     const fallback =
       state.lastFallbackProviders.length > 0
@@ -324,23 +349,50 @@ function renderOpenRouterStatus(
   ctx.ui.setStatus("openrouter-provider", `OpenRouter: ${parts.join(", ")}`)
 }
 
+/**
+ * Accumulate prompt-cache totals. Cached tokens are only counted when the
+ * provider also reported a prompt total, so a hit rate can never exceed 100%.
+ */
+function accumulateCacheStats(
+  state: GenerationState,
+  data: OpenRouterGenerationData
+): void {
+  const promptTokens = data.native_tokens_prompt
+  if (promptTokens !== undefined && promptTokens > 0) {
+    state.promptTokens += promptTokens
+    state.cacheReadTokens += data.native_tokens_cached ?? 0
+  }
+  state.cacheDiscountTotal += data.cache_discount ?? 0
+}
+
+/** Fold one newly resolved generation into the session cost, speed, and cache totals. */
+function accumulateGeneration(
+  state: GenerationState,
+  generationId: string,
+  data: OpenRouterGenerationData
+): void {
+  const cost = data.total_cost ?? 0
+  state.costs.set(generationId, cost)
+  state.costTotal += cost
+  state.lastTurnCost = cost
+
+  const tokens = data.tokens_completion ?? 0
+  const generationTimeMs = data.generation_time ?? 0
+  state.lastTurnTps =
+    tokens > 0 && generationTimeMs > 0
+      ? tokens / (generationTimeMs / 1000)
+      : undefined
+
+  accumulateCacheStats(state, data)
+}
+
 function recordGenerationCost(
   state: GenerationState,
   generationId: string,
   data: OpenRouterGenerationData | undefined
 ): void {
   if (data !== undefined && !state.costs.has(generationId)) {
-    const cost = data.total_cost ?? 0
-    state.costs.set(generationId, cost)
-    state.costTotal += cost
-    state.lastTurnCost = cost
-
-    const tokens = data.tokens_completion ?? 0
-    const generationTimeMs = data.generation_time ?? 0
-    state.lastTurnTps =
-      tokens > 0 && generationTimeMs > 0
-        ? tokens / (generationTimeMs / 1000)
-        : undefined
+    accumulateGeneration(state, generationId, data)
   }
   if (data?.provider_name !== undefined) {
     state.lastProviderName = data.provider_name
