@@ -26,8 +26,6 @@ interface OpenRouterGenerationData {
   native_tokens_cached?: number | undefined
   /** Provider-native prompt tokens, the denominator for the cache hit rate. */
   native_tokens_prompt?: number | undefined
-  /** USD discount OpenRouter applied because prompt tokens were cached. */
-  cache_discount?: number | undefined
 }
 
 interface OpenRouterEndpoint {
@@ -127,8 +125,6 @@ interface GenerationState {
   cacheReadTokens: number
   /** Cumulative provider-native prompt tokens across resolved generations. */
   promptTokens: number
-  /** Cumulative USD discount from prompt caching. */
-  cacheDiscountTotal: number
 }
 
 function createGenerationState(): GenerationState {
@@ -144,7 +140,6 @@ function createGenerationState(): GenerationState {
     lastFallbackProviders: [],
     cacheReadTokens: 0,
     promptTokens: 0,
-    cacheDiscountTotal: 0,
   }
 }
 
@@ -220,7 +215,6 @@ function toGenerationData(
     generation_time: readFiniteNumber(value.generation_time),
     native_tokens_cached: readFiniteNumber(value.native_tokens_cached),
     native_tokens_prompt: readFiniteNumber(value.native_tokens_prompt),
-    cache_discount: readFiniteNumber(value.cache_discount),
   }
 }
 
@@ -336,9 +330,6 @@ function renderOpenRouterStatus(
     const hitRate = (state.cacheReadTokens / state.promptTokens) * 100
     parts.push(`cache ${Math.round(hitRate)}%`)
   }
-  if (state.cacheDiscountTotal > 0) {
-    parts.push(`saved $${state.cacheDiscountTotal.toFixed(4)}`)
-  }
   if (state.lastProviderName !== undefined) {
     const fallback =
       state.lastFallbackProviders.length > 0
@@ -362,7 +353,6 @@ function accumulateCacheStats(
     state.promptTokens += promptTokens
     state.cacheReadTokens += data.native_tokens_cached ?? 0
   }
-  state.cacheDiscountTotal += data.cache_discount ?? 0
 }
 
 /** Fold one newly resolved generation into the session cost, speed, and cache totals. */
