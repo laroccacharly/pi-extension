@@ -1,5 +1,13 @@
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, test } from "node:test"
@@ -186,6 +194,29 @@ await test("preserves other settings, including changes since startup", async ()
     ...settings,
     fastCodex: false,
   })
+})
+
+await test("writes through symlinked settings without replacing the link", async () => {
+  const target = join(agentDir, "managed-settings.json")
+  const path = join(agentDir, "settings.json")
+  const settings = { theme: "dark", packages: ["../../Work/pi-cursor-sdk"] }
+  writeFileSync(target, JSON.stringify(settings))
+  symlinkSync(target, path)
+  const app = setup()
+
+  for (const enabled of [true, false]) {
+    await app.command(enabled ? "on" : "off")
+    assert.equal(lstatSync(path).isSymbolicLink(), true)
+    assert.equal(readlinkSync(path), target)
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf-8")), {
+      ...settings,
+      fastCodex: enabled,
+    })
+    assert.deepEqual(
+      app.request({}),
+      enabled ? { service_tier: "priority" } : undefined
+    )
+  }
 })
 
 await test("invalid settings default off and are not overwritten", async () => {

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent"
@@ -54,11 +54,10 @@ function saveEnabled(
 ): void {
   mkdirSync(agentDir, { recursive: true })
   const settings = { ...loadSettings(configPath), fastCodex: enabled }
-  const temporaryPath = `${configPath}.${process.pid}.tmp`
-  writeFileSync(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, {
+  // Write through settings symlinks rather than replacing the link itself.
+  writeFileSync(configPath, `${JSON.stringify(settings, null, 2)}\n`, {
     mode: 0o600,
   })
-  renameSync(temporaryPath, configPath)
 }
 
 export default function fastCodex(pi: ExtensionAPI): void {
