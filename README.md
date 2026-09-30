@@ -38,7 +38,7 @@ The separate `fast-codex.ts` extension adds `/fast-codex` for models on the `ope
 - `/fast-codex on` requests `service_tier: "priority"` on subsequent Codex requests.
 - `/fast-codex off` stops overriding the service tier.
 
-Fast mode starts off and resets on session start or `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
+Fast mode defaults off. The toggle is saved as `"fastCodex": true` or `false` in `~/.pi/agent/settings.json` (or the directory specified by `PI_CODING_AGENT_DIR`), preserving other settings, and persists across new sessions and `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
 
 ## Install globally
 

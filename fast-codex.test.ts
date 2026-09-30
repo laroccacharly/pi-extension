@@ -1,7 +1,28 @@
 import assert from "node:assert/strict"
-import { test } from "node:test"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterEach, beforeEach, test } from "node:test"
 
 import fastCodex from "./fast-codex.ts"
+
+let agentDir: string
+let previousAgentDir: string | undefined
+
+beforeEach(() => {
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR
+  agentDir = mkdtempSync(join(tmpdir(), "fast-codex-test-"))
+  process.env.PI_CODING_AGENT_DIR = agentDir
+})
+
+afterEach(() => {
+  if (previousAgentDir === undefined) {
+    delete process.env.PI_CODING_AGENT_DIR
+  } else {
+    process.env.PI_CODING_AGENT_DIR = previousAgentDir
+  }
+  rmSync(agentDir, { recursive: true, force: true })
+})
 
 interface MockContext {
   model: { provider: string }
@@ -133,12 +154,52 @@ await test("only affects Codex, including after switching models", async () => {
   assert.equal(app.statuses.get("fast-codex"), "Codex fast: on")
 })
 
-await test("session start resets fast mode", async () => {
+await test("fast mode persists across new sessions and extension reloads", async () => {
   const app = setup()
   await app.command("on")
   app.start()
-  assert.equal(app.request({}), undefined)
-  assert.equal(app.statuses.get("fast-codex"), undefined)
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
+  assert.equal(app.statuses.get("fast-codex"), "Codex fast: on")
+
+  const reloaded = setup()
+  reloaded.start()
+  assert.deepEqual(reloaded.request({}), { service_tier: "priority" })
+  assert.equal(reloaded.statuses.get("fast-codex"), "Codex fast: on")
+  await reloaded.command("off")
+
+  const restarted = setup()
+  restarted.start()
+  assert.equal(restarted.request({}), undefined)
+  assert.equal(restarted.statuses.get("fast-codex"), undefined)
+})
+
+await test("preserves other settings, including changes since startup", async () => {
+  const path = join(agentDir, "settings.json")
+  writeFileSync(path, JSON.stringify({ theme: "dark", fastCodex: true }))
+  const app = setup()
+  app.start()
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
+  const settings = { theme: "light", compaction: { enabled: false } }
+  writeFileSync(path, JSON.stringify(settings))
+  await app.command("off")
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf-8")), {
+    ...settings,
+    fastCodex: false,
+  })
+})
+
+await test("invalid settings default off and are not overwritten", async () => {
+  const path = join(agentDir, "settings.json")
+  for (const contents of ["invalid JSON", "null", "[]"]) {
+    writeFileSync(path, contents)
+    const app = setup()
+    app.start()
+    assert.equal(app.request({}), undefined)
+    await app.command("on")
+    assert.equal(app.request({}), undefined)
+    assert.equal(app.notifications.at(-1)?.level, "error")
+    assert.equal(readFileSync(path, "utf-8"), contents)
+  }
 })
 
 await test("ignores non-object payloads", async () => {

@@ -1,3 +1,7 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+
+import { getAgentDir } from "@earendil-works/pi-coding-agent"
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -14,8 +18,53 @@ function updateStatus(
   )
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function loadSettings(configPath: string): Record<string, unknown> {
+  let contents: string
+  try {
+    contents = readFileSync(configPath, "utf-8")
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {}
+    }
+    throw error
+  }
+  const saved: unknown = JSON.parse(contents)
+  if (!isRecord(saved)) {
+    throw new Error("Settings must be a JSON object")
+  }
+  return saved
+}
+
+function loadEnabled(configPath: string): boolean {
+  try {
+    return loadSettings(configPath).fastCodex === true
+  } catch {
+    return false
+  }
+}
+
+function saveEnabled(
+  agentDir: string,
+  configPath: string,
+  enabled: boolean
+): void {
+  mkdirSync(agentDir, { recursive: true })
+  const settings = { ...loadSettings(configPath), fastCodex: enabled }
+  const temporaryPath = `${configPath}.${process.pid}.tmp`
+  writeFileSync(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, {
+    mode: 0o600,
+  })
+  renameSync(temporaryPath, configPath)
+}
+
 export default function fastCodex(pi: ExtensionAPI): void {
-  let enabled = false
+  const agentDir = getAgentDir()
+  const configPath = join(agentDir, "settings.json")
+  let enabled = loadEnabled(configPath)
 
   pi.registerCommand("fast-codex", {
     description: "Toggle Codex priority service (on/off; higher usage charges)",
@@ -31,7 +80,14 @@ export default function fastCodex(pi: ExtensionAPI): void {
       }
 
       await ctx.waitForIdle()
-      enabled = mode === "" ? !enabled : mode === "on"
+      const nextEnabled = mode === "" ? !enabled : mode === "on"
+      try {
+        saveEnabled(agentDir, configPath, nextEnabled)
+      } catch {
+        ctx.ui.notify("Could not save Codex fast mode", "error")
+        return
+      }
+      enabled = nextEnabled
       updateStatus(ctx, ctx.model.provider, enabled)
       ctx.ui.notify(
         enabled
@@ -43,7 +99,7 @@ export default function fastCodex(pi: ExtensionAPI): void {
   })
 
   pi.on("session_start", (_event, ctx) => {
-    enabled = false
+    enabled = loadEnabled(configPath)
     updateStatus(ctx, ctx.model?.provider, enabled)
   })
 
