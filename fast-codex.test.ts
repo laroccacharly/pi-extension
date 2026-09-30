@@ -1,0 +1,150 @@
+import assert from "node:assert/strict"
+import { test } from "node:test"
+
+import fastCodex from "./fast-codex.ts"
+
+interface MockContext {
+  model: { provider: string }
+  waitForIdle: () => Promise<void>
+  ui: {
+    notify: (message: string, level: string) => void
+    setStatus: (key: string, value: string | undefined) => void
+  }
+}
+
+interface MockEvent {
+  payload?: unknown
+  model?: { provider: string }
+}
+
+interface MockAPI {
+  on: (
+    name: string,
+    handler: (event: MockEvent, ctx: MockContext) => unknown
+  ) => void
+  registerCommand: (
+    name: string,
+    command: { handler: (args: string, ctx: MockContext) => Promise<void> }
+  ) => void
+}
+
+function setup(provider = "openai-codex") {
+  const events = new Map<
+    string,
+    (event: MockEvent, ctx: MockContext) => unknown
+  >()
+  const commands = new Map<
+    string,
+    { handler: (args: string, ctx: MockContext) => Promise<void> }
+  >()
+  const notifications: { message: string; level: string }[] = []
+  const statuses = new Map<string, string | undefined>()
+  const ctx: MockContext = {
+    model: { provider },
+    waitForIdle: async () => {
+      await Promise.resolve()
+    },
+    ui: {
+      notify: (message, level) => {
+        notifications.push({ message, level })
+      },
+      setStatus: (key, value) => {
+        statuses.set(key, value)
+      },
+    },
+  }
+  // The fixture supplies only the API and context members used by this extension.
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+  const register = fastCodex as unknown as (pi: MockAPI) => void
+  register({
+    on: (name, handler) => {
+      events.set(name, handler)
+    },
+    registerCommand: (name, command) => {
+      commands.set(name, command)
+    },
+  })
+  const command = commands.get("fast-codex")
+  const request = events.get("before_provider_request")
+  const start = events.get("session_start")
+  const select = events.get("model_select")
+  assert.ok(command && request && start && select)
+  return {
+    notifications,
+    statuses,
+    command: async (args = "") => {
+      await command.handler(args, ctx)
+    },
+    request: (payload: unknown) => request({ payload }, ctx),
+    start: () => start({}, ctx),
+    select: (nextProvider: string) => {
+      ctx.model = { provider: nextProvider }
+      select({ model: ctx.model }, ctx)
+    },
+  }
+}
+
+await test("defaults off and toggles priority without mutating the payload", async () => {
+  const app = setup()
+  const payload = { model: "gpt-5.5", input: [], service_tier: "default" }
+  assert.equal(app.request(payload), undefined)
+  await app.command()
+  assert.deepEqual(app.request(payload), {
+    ...payload,
+    service_tier: "priority",
+  })
+  assert.equal(payload.service_tier, "default")
+  assert.equal(app.statuses.get("fast-codex"), "Codex fast: on")
+  await app.command()
+  assert.equal(app.request(payload), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+})
+
+await test("explicit on and off are idempotent", async () => {
+  const app = setup()
+  await app.command("on")
+  await app.command(" ON ")
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
+  await app.command("off")
+  await app.command("off")
+  assert.equal(app.request({}), undefined)
+})
+
+await test("invalid arguments do not change the mode", async () => {
+  const app = setup()
+  await app.command("on")
+  await app.command("invalid")
+  assert.equal(app.notifications.at(-1)?.level, "warning")
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
+})
+
+await test("only affects Codex, including after switching models", async () => {
+  const app = setup()
+  await app.command("on")
+  for (const provider of ["openai", "openrouter", "anthropic"]) {
+    app.select(provider)
+    assert.equal(app.request({}), undefined)
+    assert.equal(app.statuses.get("fast-codex"), undefined)
+    await app.command("off")
+    assert.equal(app.notifications.at(-1)?.level, "warning")
+  }
+  app.select("openai-codex")
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
+  assert.equal(app.statuses.get("fast-codex"), "Codex fast: on")
+})
+
+await test("session start resets fast mode", async () => {
+  const app = setup()
+  await app.command("on")
+  app.start()
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+})
+
+await test("ignores non-object payloads", async () => {
+  const app = setup()
+  await app.command("on")
+  for (const payload of [null, undefined, [], "payload", 42]) {
+    assert.equal(app.request(payload), undefined)
+  }
+})

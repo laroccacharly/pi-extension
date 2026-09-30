@@ -30,11 +30,22 @@ The extension tracks the last five models you selected or used, most recent firs
 
 `/last-models` shows that list as a selector. Picking an entry switches the session to it (via the same resolution path as `/model`). When nothing has been used yet the command reports that the list is empty.
 
+## Codex fast mode
+
+The separate `fast-codex.ts` extension adds `/fast-codex` for models on the `openai-codex` provider:
+
+- `/fast-codex` toggles fast mode.
+- `/fast-codex on` requests `service_tier: "priority"` on subsequent Codex requests.
+- `/fast-codex off` stops overriding the service tier.
+
+Fast mode starts off and resets on session start or `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
+
 ## Install globally
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
 ln -sf ~/Work/pi-extension/openrouter-provider.ts ~/.pi/agent/extensions/openrouter-provider.ts
+ln -sf ~/Work/pi-extension/fast-codex.ts ~/.pi/agent/extensions/fast-codex.ts
 ```
 
 Run `/reload` in Pi after changing the extension.
@@ -44,6 +55,7 @@ Run `/reload` in Pi after changing the extension.
 ```bash
 npm install --ignore-scripts
 npm run check
+node --test fast-codex.test.ts
 npm run format
 ```
 
