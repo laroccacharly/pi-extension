@@ -6,6 +6,8 @@ Pi extension that displays the OpenRouter upstream provider used for each respon
 
 Pi prices OpenRouter tokens from the static model catalog, which ignores OpenRouter's per-request cost (routing, time-of-day price overrides, fees). After each assistant response the extension fetches `GET /api/v1/generation?id=<responseId>` and reads the returned `total_cost`, `tokens_completion`, `generation_time`, `native_tokens_cached`, and `native_tokens_prompt`. The footer status shows `($lastTurn), $sessionTotal, tokensPerSecond, cacheHitPercent, providerName`, i.e. last response cost, cumulative session cost, the actual generation speed in tokens per second (`tokens_completion / (generation_time / 1000)`), the cumulative prompt-cache hit rate (`native_tokens_cached / native_tokens_prompt`), and upstream provider. The cache hit rate only appears once a resolved generation reports a provider-native prompt token count, so endpoints without prompt caching do not show a misleading `0%`. When OpenRouter falls back from one or more endpoints, the provider is annotated with the attempts it fell back from, e.g. `Modal (fb: Parasail, BaseTen)`, read from the generation response's `provider_responses` chain. This is OpenRouter's authoritative billed cost, so it can differ from the estimate in Pi's built-in cost display. The totals reset when a new session starts.
 
+Every generation, including tool-call responses, goes through the same lookup. OpenRouter often needs a few seconds to index a generation, and lookups can also hit rate limits or server errors, so 404, 408, 429, 5xx, and network failures are retried: six quick attempts (about 10 seconds), then in the background with backoff for about ten more minutes. Other errors, such as an invalid key, give up immediately. While any lookup is still retrying, a separate footer entry shows `↻ N retrying`; it stays visible across status changes and model switches and disappears once nothing is retrying. When some costs are missing from the total, the main status adds `N priced` and, for lookups that gave up, `N unpriced`. If nothing has been priced yet, it shows `waiting for generation stats… (attempt N)` while retrying, or `provider unavailable (<reason>)` with OpenRouter's error message or the failed request's error.
+
 The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one pins that provider as the only allowed endpoint (no fallbacks) in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override and lets OpenRouter route normally.
 
 ## Auto-route sort
@@ -55,9 +57,12 @@ Run `/reload` in Pi after changing the extension.
 ```bash
 npm install --ignore-scripts
 npm run check
-node --test fast-codex.test.ts
+npm test
+npm run test:e2e
 npm run format
 ```
+
+`npm run test:e2e` runs the real `pi` binary (override with `PI_BIN`) in RPC mode with only this extension loaded, against a local OpenRouter stub (`e2e/openrouter-stub.ts`). Each test starts the stub on a random port with a scripted scenario (streamed completions, tool calls, generation lookups that 404 for a number of attempts or fail with an HTTP error), points Pi's `openrouter` provider at it through an isolated `HOME`/`models.json`, and asserts on the footer statuses Pi emits as `setStatus` events. Two environment variables make this possible and are only meant for testing: `PI_OPENROUTER_API_URL` replaces the `https://openrouter.ai/api/v1` base used by the extension, and `PI_OPENROUTER_RETRY_DELAY_SCALE` multiplies the generation retry delays (the tests use `0.01`). The tests are skipped when `pi` is not installed.
 
 Linting uses Oxlint with Ultracite's core rules. Formatting uses Oxfmt with Ultracite defaults.
 

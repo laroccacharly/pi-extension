@@ -77,7 +77,25 @@ interface RecentModelEntry {
   lastUsedAt: number
 }
 
+function readRetryDelayScale(value: string | undefined): number {
+  const scale = Number(value)
+  return value !== undefined && Number.isFinite(scale) && scale >= 0 ? scale : 1
+}
+
+/** API base, overridable so end-to-end tests can point at a local stub server. */
+const OPENROUTER_API_URL =
+  process.env.PI_OPENROUTER_API_URL ?? "https://openrouter.ai/api/v1"
+/** Multiplier for generation retry delays; tests shrink it to keep runs fast. */
+const RETRY_DELAY_SCALE = readRetryDelayScale(
+  process.env.PI_OPENROUTER_RETRY_DELAY_SCALE
+)
 const RETRY_DELAYS_MS = [0, 250, 750, 1500, 3000, 5000] as const
+/** Background retries after RETRY_DELAYS_MS while OpenRouter still has not indexed a generation. */
+const LATE_RETRY_DELAYS_MS = [
+  10_000, 20_000, 30_000, 60_000, 120_000, 300_000,
+] as const
+/** Footer entry counting generations still being retried in the background. */
+const RETRY_STATUS_KEY = "openrouter-retries"
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-provider.json")
 const MODELS_CACHE_PATH = join(
   homedir(),
@@ -86,7 +104,7 @@ const MODELS_CACHE_PATH = join(
   "openrouter-models-cache.json"
 )
 const MODELS_CACHE_TTL_MS = 30 * 60 * 1000
-const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+const OPENROUTER_MODELS_URL = `${OPENROUTER_API_URL}/models`
 const RECENT_MODELS_LIMIT = 10
 const LAST_MODELS_PATH = join(homedir(), ".pi", "agent", "last-models.json")
 const LAST_MODELS_LIMIT = 5
@@ -107,6 +125,16 @@ const SORT_OPTIONS: SortOption[] = [
   { label: "OpenRouter default — no sort override", by: undefined },
 ]
 
+interface LookupFailure {
+  message: string
+  /** Not indexed yet, rate limited, or a server/network error: a later retry may succeed. */
+  retryable: boolean
+}
+
+type LookupResult =
+  | { data: OpenRouterGenerationData }
+  | { failure: LookupFailure }
+
 interface GenerationState {
   /** Actual USD cost per resolved generation, keyed by OpenRouter generation id. */
   costs: Map<string, number>
@@ -116,8 +144,17 @@ interface GenerationState {
   resolved: Map<string, OpenRouterGenerationData>
   /** Background lookups that must settle before the final status is rendered. */
   pendingRefreshes: Set<Promise<void>>
+  /** Generations whose lookup failed and is still being retried, quickly or in the background. */
+  retrying: Set<string>
+  /** Generations handed to the slower background poll, so only one poll runs per id. */
+  lateRetries: Set<string>
+  /** HTTP lookups made so far per generation id, shown while waiting. */
+  lookupAttempts: Map<string, number>
+  /** Why each unresolved generation lookup failed, keyed by generation id. */
+  lookupFailures: Map<string, LookupFailure>
+  /** Most recent generation; only it may set the per-turn speed and provider. */
+  latestGenerationId: string | undefined
   costTotal: number
-  lastTurnCost: number | undefined
   lastTurnTps: number | undefined
   lastProviderName: string | undefined
   lastFallbackProviders: string[]
@@ -133,8 +170,12 @@ function createGenerationState(): GenerationState {
     requests: new Map(),
     resolved: new Map(),
     pendingRefreshes: new Set(),
+    retrying: new Set(),
+    lateRetries: new Set(),
+    lookupAttempts: new Map(),
+    lookupFailures: new Map(),
+    latestGenerationId: undefined,
     costTotal: 0,
-    lastTurnCost: undefined,
     lastTurnTps: undefined,
     lastProviderName: undefined,
     lastFallbackProviders: [],
@@ -239,60 +280,34 @@ function toEndpoint(value: unknown): OpenRouterEndpoint | undefined {
   }
 }
 
-async function fetchGeneration(
-  state: GenerationState,
-  generationId: string,
-  ctx: ExtensionContext
-): Promise<OpenRouterGenerationData | undefined> {
-  const resolved = state.resolved.get(generationId)
-  if (resolved !== undefined) {
-    return resolved
-  }
-
-  const existing = state.requests.get(generationId)
-  if (existing !== undefined) {
-    return await existing
-  }
-
-  const request = (async (): Promise<OpenRouterGenerationData | undefined> => {
-    try {
-      const url = new URL("https://openrouter.ai/api/v1/generation")
-      url.searchParams.set("id", generationId)
-      const headers = await getOpenRouterHeaders(ctx)
-
-      for (const [index, delayMs] of RETRY_DELAYS_MS.entries()) {
-        if (delayMs > 0) {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, delayMs)
-          })
-        }
-
-        const response = await fetch(url, { headers })
-        if (response.status === 404 && index < RETRY_DELAYS_MS.length - 1) {
-          continue
-        }
-        if (!response.ok) {
-          throw new Error(`OpenRouter returned HTTP ${response.status}`)
-        }
-
-        const result: unknown = await response.json()
-        return isRecord(result) ? toGenerationData(result.data) : undefined
-      }
-    } catch {
-      // Fall through and let the caller treat this generation as unresolved.
-    }
-  })()
-
-  state.requests.set(generationId, request)
+/** Summarize a failed OpenRouter response, preferring its JSON error message. */
+async function describeHttpError(response: Response): Promise<string> {
+  const prefix = `HTTP ${response.status}`
+  const body = await response.text().catch(() => "")
   try {
-    const data = await request
-    if (data !== undefined) {
-      state.resolved.set(generationId, data)
+    const parsed: unknown = JSON.parse(body)
+    const message =
+      isRecord(parsed) && isRecord(parsed.error)
+        ? readString(parsed.error.message)
+        : undefined
+    if (message !== undefined) {
+      return `${prefix}: ${message}`
     }
-    return data
-  } finally {
-    state.requests.delete(generationId)
+  } catch {
+    // Not JSON; fall back to the raw body.
   }
+  return body.trim() === "" ? prefix : `${prefix}: ${body.trim()}`
+}
+
+/** Status shown when no provider could be resolved, with a compact reason. */
+function providerUnavailableStatus(reason: string | undefined): string {
+  const base = "provider unavailable"
+  if (reason === undefined || reason.trim() === "") {
+    return base
+  }
+  const compact = reason.replaceAll(/\s+/gu, " ").trim()
+  const clipped = compact.length > 160 ? `${compact.slice(0, 159)}…` : compact
+  return `${base} (${clipped})`
 }
 
 function fallbackProviders(
@@ -315,11 +330,131 @@ function fallbackProviders(
   return names
 }
 
+/**
+ * Accumulate prompt-cache totals. Cached tokens are only counted when the
+ * provider also reported a prompt total, so a hit rate can never exceed 100%.
+ */
+function accumulateCacheStats(
+  state: GenerationState,
+  data: OpenRouterGenerationData
+): void {
+  const promptTokens = data.native_tokens_prompt
+  if (promptTokens !== undefined && promptTokens > 0) {
+    state.promptTokens += promptTokens
+    state.cacheReadTokens += data.native_tokens_cached ?? 0
+  }
+}
+
+/**
+ * Fold one resolved generation into the session. Every generation counts
+ * toward cost and cache totals exactly once, regardless of resolution order;
+ * only the latest one sets the per-turn speed and provider.
+ */
+function recordGeneration(
+  state: GenerationState,
+  generationId: string,
+  data: OpenRouterGenerationData
+): void {
+  if (!state.costs.has(generationId)) {
+    const cost = data.total_cost ?? 0
+    state.costs.set(generationId, cost)
+    state.costTotal += cost
+    accumulateCacheStats(state, data)
+  }
+  if (generationId !== state.latestGenerationId) {
+    return
+  }
+
+  const tokens = data.tokens_completion ?? 0
+  const generationTimeMs = data.generation_time ?? 0
+  state.lastTurnTps =
+    tokens > 0 && generationTimeMs > 0
+      ? tokens / (generationTimeMs / 1000)
+      : undefined
+  if (data.provider_name !== undefined) {
+    state.lastProviderName = data.provider_name
+  }
+  state.lastFallbackProviders = fallbackProviders(data)
+}
+
+/** Status before any generation in the session has resolved. */
+function unresolvedStatus(state: GenerationState): string | undefined {
+  const latest = state.latestGenerationId
+  if (latest === undefined) {
+    return undefined
+  }
+  if (state.retrying.has(latest)) {
+    const attempts = state.lookupAttempts.get(latest) ?? 0
+    return `waiting for generation stats… (attempt ${attempts})`
+  }
+  const failure = state.lookupFailures.get(latest)
+  return failure === undefined
+    ? undefined
+    : providerUnavailableStatus(failure.message)
+}
+
+/**
+ * When some generation costs are missing from the total, show how many are
+ * priced alongside how many gave up. Ones still retrying have their own entry.
+ */
+function unpricedSuffix(state: GenerationState): string | undefined {
+  const unpriced = [...state.lookupFailures.keys()].filter(
+    (id) => !state.retrying.has(id)
+  ).length
+  if (unpriced === 0 && state.retrying.size === 0) {
+    return undefined
+  }
+  const priced = `${state.costs.size} priced`
+  return unpriced > 0 ? `${priced}, ${unpriced} unpriced` : priced
+}
+
+/** Keep the background retry count visible in its own footer entry. */
+function renderRetryStatus(
+  state: GenerationState,
+  ctx: ExtensionContext
+): void {
+  if (generationState.current !== state) {
+    return
+  }
+  const count = state.retrying.size
+  ctx.ui.setStatus(
+    RETRY_STATUS_KEY,
+    count > 0 ? `↻ ${count} retrying` : undefined
+  )
+}
+
+/** Count a generation as still being retried. */
+function markRetrying(
+  state: GenerationState,
+  generationId: string,
+  ctx: ExtensionContext
+): void {
+  if (!state.retrying.has(generationId)) {
+    state.retrying.add(generationId)
+    renderRetryStatus(state, ctx)
+  }
+}
+
+/** Stop counting a generation as retrying once it resolved or gave up. */
+function clearRetrying(
+  state: GenerationState,
+  generationId: string,
+  ctx: ExtensionContext
+): void {
+  if (state.retrying.delete(generationId)) {
+    renderRetryStatus(state, ctx)
+  }
+}
+
 function renderOpenRouterStatus(
   state: GenerationState,
   ctx: ExtensionContext
 ): void {
-  if (state.lastTurnCost === undefined) {
+  if (state.costs.size === 0) {
+    const status = unresolvedStatus(state)
+    if (status !== undefined) {
+      ctx.ui.setStatus("openrouter-provider", status)
+    }
     return
   }
   const parts = [`$${state.costTotal.toFixed(4)}`]
@@ -337,57 +472,128 @@ function renderOpenRouterStatus(
         : ""
     parts.push(`${state.lastProviderName}${fallback}`)
   }
+  const suffix = unpricedSuffix(state)
+  if (suffix !== undefined) {
+    parts.push(suffix)
+  }
   ctx.ui.setStatus("openrouter-provider", parts.join(", "))
 }
 
-/**
- * Accumulate prompt-cache totals. Cached tokens are only counted when the
- * provider also reported a prompt total, so a hit rate can never exceed 100%.
- */
-function accumulateCacheStats(
+/** Count one lookup, refreshing the waiting status while it is polled late. */
+function noteLookupAttempt(
   state: GenerationState,
-  data: OpenRouterGenerationData
+  generationId: string,
+  ctx: ExtensionContext
 ): void {
-  const promptTokens = data.native_tokens_prompt
-  if (promptTokens !== undefined && promptTokens > 0) {
-    state.promptTokens += promptTokens
-    state.cacheReadTokens += data.native_tokens_cached ?? 0
+  state.lookupAttempts.set(
+    generationId,
+    (state.lookupAttempts.get(generationId) ?? 0) + 1
+  )
+  if (state.retrying.has(generationId) && generationState.current === state) {
+    renderOpenRouterStatus(state, ctx)
   }
 }
 
-/** Fold one newly resolved generation into the session cost, speed, and cache totals. */
-function accumulateGeneration(
-  state: GenerationState,
-  generationId: string,
-  data: OpenRouterGenerationData
-): void {
-  const cost = data.total_cost ?? 0
-  state.costs.set(generationId, cost)
-  state.costTotal += cost
-  state.lastTurnCost = cost
+function isRetryableStatus(status: number): boolean {
+  return status === 404 || status === 408 || status === 429 || status >= 500
+}
 
-  const tokens = data.tokens_completion ?? 0
-  const generationTimeMs = data.generation_time ?? 0
-  state.lastTurnTps =
-    tokens > 0 && generationTimeMs > 0
-      ? tokens / (generationTimeMs / 1000)
+/** One generation lookup; failures say whether retrying could still help. */
+async function lookupGenerationOnce(
+  url: URL,
+  headers: Headers
+): Promise<LookupResult> {
+  let response: Response
+  try {
+    response = await fetch(url, { headers })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { failure: { message, retryable: true } }
+  }
+  if (!response.ok) {
+    return {
+      failure: {
+        message: await describeHttpError(response),
+        retryable: isRetryableStatus(response.status),
+      },
+    }
+  }
+  const result: unknown = await response.json().catch((): unknown => null)
+  const data =
+    isRecord(result) && isRecord(result.data)
+      ? toGenerationData(result.data)
       : undefined
-
-  accumulateCacheStats(state, data)
+  if (data === undefined) {
+    return {
+      failure: {
+        message: "generation lookup returned no data",
+        retryable: false,
+      },
+    }
+  }
+  return { data }
 }
 
-function recordGenerationCost(
+async function fetchGeneration(
   state: GenerationState,
   generationId: string,
-  data: OpenRouterGenerationData | undefined
-): void {
-  if (data !== undefined && !state.costs.has(generationId)) {
-    accumulateGeneration(state, generationId, data)
+  ctx: ExtensionContext
+): Promise<OpenRouterGenerationData | undefined> {
+  const resolved = state.resolved.get(generationId)
+  if (resolved !== undefined) {
+    return resolved
   }
-  if (data?.provider_name !== undefined) {
-    state.lastProviderName = data.provider_name
+
+  const existing = state.requests.get(generationId)
+  if (existing !== undefined) {
+    return await existing
   }
-  state.lastFallbackProviders = fallbackProviders(data)
+
+  const request = (async (): Promise<OpenRouterGenerationData | undefined> => {
+    try {
+      const url = new URL(`${OPENROUTER_API_URL}/generation`)
+      url.searchParams.set("id", generationId)
+      const headers = await getOpenRouterHeaders(ctx)
+
+      for (const delayMs of RETRY_DELAYS_MS) {
+        if (delayMs > 0) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, delayMs * RETRY_DELAY_SCALE)
+          })
+        }
+
+        noteLookupAttempt(state, generationId, ctx)
+        const result = await lookupGenerationOnce(url, headers)
+        if ("data" in result) {
+          state.lookupFailures.delete(generationId)
+          return result.data
+        }
+        state.lookupFailures.set(generationId, result.failure)
+        if (!result.failure.retryable) {
+          break
+        }
+        markRetrying(state, generationId, ctx)
+      }
+    } catch (error) {
+      // Let the caller treat this generation as unresolved, but keep the reason.
+      state.lookupFailures.set(generationId, {
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false,
+      })
+    }
+    return undefined
+  })()
+
+  state.requests.set(generationId, request)
+  try {
+    const data = await request
+    if (data !== undefined) {
+      state.resolved.set(generationId, data)
+    }
+    return data
+  } finally {
+    state.requests.delete(generationId)
+  }
 }
 
 /** Replace a JSON file atomically, creating it with owner-only permissions. */
@@ -451,8 +657,8 @@ function saveSelectedSort(by: SortBy | undefined): void {
 
 function autoRouteStatus(): string {
   return selectedSortBy === undefined
-    ? "OpenRouter: auto-routing (OpenRouter default)"
-    : `OpenRouter: auto-routing by ${selectedSortBy}`
+    ? "auto-routing (OpenRouter default)"
+    : `auto-routing by ${selectedSortBy}`
 }
 
 function updateStatusForModel(
@@ -470,7 +676,7 @@ function updateStatusForModel(
     "openrouter-provider",
     preferredProvider === undefined
       ? autoRouteStatus()
-      : `OpenRouter: preferring ${preferredProvider}`
+      : `preferring ${preferredProvider}`
   )
 }
 
@@ -682,13 +888,66 @@ async function refreshModelsInBackground(
   }
 }
 
+/**
+ * Keep polling a generation OpenRouter has not indexed yet, then refresh the
+ * status so its cost is reflected even after the turn has settled.
+ */
+async function retryLateGeneration(
+  state: GenerationState,
+  generationId: string,
+  ctx: ExtensionContext
+): Promise<void> {
+  try {
+    for (const delayMs of LATE_RETRY_DELAYS_MS) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs * RETRY_DELAY_SCALE)
+      })
+      if (generationState.current !== state) {
+        return
+      }
+      const data = await fetchGeneration(state, generationId, ctx)
+      if (data !== undefined) {
+        recordGeneration(state, generationId, data)
+        return
+      }
+      if (state.lookupFailures.get(generationId)?.retryable !== true) {
+        return
+      }
+    }
+  } finally {
+    state.lateRetries.delete(generationId)
+    clearRetrying(state, generationId, ctx)
+    // A replaced session's late work must never update the new session's UI.
+    if (generationState.current === state) {
+      renderOpenRouterStatus(state, ctx)
+    }
+  }
+}
+
+/** Resolve one generation, handing it to a background poll if it is not indexed yet. */
 async function refreshGeneration(
   state: GenerationState,
   generationId: string,
   ctx: ExtensionContext
 ): Promise<void> {
+  if (state.lateRetries.has(generationId)) {
+    return
+  }
   const data = await fetchGeneration(state, generationId, ctx)
-  recordGenerationCost(state, generationId, data)
+  if (data !== undefined) {
+    recordGeneration(state, generationId, data)
+    clearRetrying(state, generationId, ctx)
+    return
+  }
+  if (state.lateRetries.has(generationId)) {
+    return
+  }
+  if (state.lookupFailures.get(generationId)?.retryable === true) {
+    state.lateRetries.add(generationId)
+    void retryLateGeneration(state, generationId, ctx)
+    return
+  }
+  clearRetrying(state, generationId, ctx)
 }
 
 function queueGenerationRefresh(
@@ -726,7 +985,7 @@ async function fetchEndpoints(
   modelId: string
 ): Promise<OpenRouterEndpoint[]> {
   const response = await fetch(
-    `https://openrouter.ai/api/v1/models/${modelId}/endpoints`,
+    `${OPENROUTER_API_URL}/models/${modelId}/endpoints`,
     { headers: await getOpenRouterHeaders(ctx) }
   )
   if (!response.ok) {
@@ -864,7 +1123,7 @@ function registerProviderSelectionCommand(
         saveSelectedRoutes(selectedRoutes)
         ctx.ui.setStatus(
           "openrouter-provider",
-          `OpenRouter: preferring ${endpoint.provider_name ?? endpoint.tag}`
+          `preferring ${endpoint.provider_name ?? endpoint.tag}`
         )
       } catch (error) {
         ctx.ui.notify(
@@ -1017,6 +1276,7 @@ function registerSessionStatusHandlers(
     // A replacement state prevents late work from the prior session from
     // changing the new session's totals, even if its network request finishes.
     generationState.current = createGenerationState()
+    ctx.ui.setStatus(RETRY_STATUS_KEY, undefined)
 
     if (ctx.model === undefined) {
       ctx.ui.setStatus("openrouter-provider", undefined)
@@ -1097,9 +1357,22 @@ function registerModelTrackingHandlers(pi: ExtensionAPI): void {
       return
     }
     // Prefetch every generation so tool-call responses count toward the total.
-    // This task mutates only its captured session state and never touches UI.
+    generationState.current.latestGenerationId = generationId
     queueGenerationRefresh(generationState.current, generationId, ctx)
   })
+}
+
+/** Explain why an assistant message carries no OpenRouter generation id. */
+function missingGenerationReason(message: {
+  stopReason: string
+  errorMessage?: string
+}): string {
+  if (message.errorMessage !== undefined) {
+    return message.errorMessage
+  }
+  return message.stopReason === "aborted"
+    ? "request aborted"
+    : `no generation id (stop reason: ${message.stopReason})`
 }
 
 async function settleGenerationStatus(ctx: ExtensionContext): Promise<void> {
@@ -1125,14 +1398,18 @@ async function settleGenerationStatus(ctx: ExtensionContext): Promise<void> {
 
   const generationId = entry.message.responseId
   if (generationId === undefined) {
-    ctx.ui.setStatus("openrouter-provider", "OpenRouter: provider unavailable")
+    ctx.ui.setStatus(
+      "openrouter-provider",
+      providerUnavailableStatus(missingGenerationReason(entry.message))
+    )
     return
   }
 
-  if (state.lastTurnCost === undefined) {
-    ctx.ui.setStatus("openrouter-provider", "OpenRouter: resolving provider…")
+  if (state.costs.size === 0) {
+    ctx.ui.setStatus("openrouter-provider", "resolving provider…")
   }
 
+  state.latestGenerationId = generationId
   queueGenerationRefresh(state, generationId, ctx)
   await Promise.all(state.pendingRefreshes)
   state.pendingRefreshes.clear()
@@ -1140,14 +1417,6 @@ async function settleGenerationStatus(ctx: ExtensionContext): Promise<void> {
   // A session replacement can occur while OpenRouter is being queried. The
   // old state may finish, but its old context must never update the new UI.
   if (generationState.current !== state) {
-    return
-  }
-
-  if (
-    state.lastProviderName === undefined &&
-    state.lastTurnCost === undefined
-  ) {
-    ctx.ui.setStatus("openrouter-provider", "OpenRouter: provider unavailable")
     return
   }
 
