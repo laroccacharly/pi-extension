@@ -42,12 +42,23 @@ The separate `fast-codex.ts` extension adds `/fast-codex` for models on the `ope
 
 Fast mode defaults off. The toggle is saved as `"fastCodex": true` or `false` in `~/.pi/agent/settings.json` (or the directory specified by `PI_CODING_AGENT_DIR`), preserving other settings, and persists across new sessions and `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
 
+## Venice provider
+
+The separate `venice-provider.ts` extension adds a `venice` provider for [Venice](https://venice.ai), which serves an OpenAI-compatible API at `https://api.venice.ai/api/v1`. Requests go through Pi's built-in `openai-completions` implementation.
+
+- `/login-venice` prompts for an API key and saves it to `~/.pi/agent/venice.json` (mode 0600). Without a saved key, the provider reads `VENICE_API_KEY`. Venice models only appear in `/model` once one of the two is set.
+- Models come from Venice's public `GET /models?type=text` catalog, filtered to online models that support function calling (Pi's tools need it). Context window, output limit, vision, reasoning, and USD pricing are mapped from `model_spec`. The catalog is cached in `~/.pi/agent/venice-models-cache.json` and refreshed when `/model` opens.
+- Every Venice request sets `venice_parameters.include_venice_system_prompt: false`, so Venice does not prepend its own system prompt to Pi's.
+
+`PI_VENICE_API_URL` overrides the API base URL for testing.
+
 ## Install globally
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
 ln -sf ~/Work/pi-extension/openrouter-provider.ts ~/.pi/agent/extensions/openrouter-provider.ts
 ln -sf ~/Work/pi-extension/fast-codex.ts ~/.pi/agent/extensions/fast-codex.ts
+ln -sf ~/Work/pi-extension/venice-provider.ts ~/.pi/agent/extensions/venice-provider.ts
 ```
 
 Run `/reload` in Pi after changing the extension.
