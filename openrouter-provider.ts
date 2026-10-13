@@ -1,11 +1,10 @@
 import { readFileSync, renameSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
 import { join } from "node:path"
 
+import { getAgentDir } from "@earendil-works/pi-coding-agent"
 import type {
   ExtensionAPI,
   ExtensionContext,
-  ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent"
 
 interface OpenRouterProviderResponse {
@@ -37,37 +36,10 @@ interface OpenRouterEndpoint {
   uptime_last_30m?: number
 }
 
-interface OpenRouterModelArchitecture {
-  input_modalities?: string[]
-  output_modalities?: string[]
-}
-
-interface OpenRouterModelPricing {
-  prompt?: string
-  completion?: string
-  input_cache_read?: string
-  input_cache_write?: string
-}
-
-interface OpenRouterModelTopProvider {
-  context_length?: number
-  max_completion_tokens?: number
-}
-
+/** The fields of a public `GET /models` entry used to order models by release. */
 interface OpenRouterModel {
   id: string
-  name?: string
   created?: number
-  context_length?: number
-  architecture?: OpenRouterModelArchitecture
-  pricing?: OpenRouterModelPricing
-  top_provider?: OpenRouterModelTopProvider
-  supported_parameters?: string[]
-}
-
-interface OpenRouterModelsCache {
-  checkedAt: number
-  models: OpenRouterModel[]
 }
 
 interface RecentModelEntry {
@@ -96,19 +68,12 @@ const LATE_RETRY_DELAYS_MS = [
 ] as const
 /** Footer entry counting generations still being retried in the background. */
 const RETRY_STATUS_KEY = "openrouter-retries"
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-provider.json")
-const MODELS_CACHE_PATH = join(
-  homedir(),
-  ".pi",
-  "agent",
-  "openrouter-models-cache.json"
-)
-const MODELS_CACHE_TTL_MS = 30 * 60 * 1000
+const CONFIG_PATH = join(getAgentDir(), "openrouter-provider.json")
 const OPENROUTER_MODELS_URL = `${OPENROUTER_API_URL}/models`
-const RECENT_MODELS_LIMIT = 10
-const LAST_MODELS_PATH = join(homedir(), ".pi", "agent", "last-models.json")
+const NEWEST_MODELS_LIMIT = 10
+const LAST_MODELS_PATH = join(getAgentDir(), "last-models.json")
 const LAST_MODELS_LIMIT = 5
-const SORT_CONFIG_PATH = join(homedir(), ".pi", "agent", "openrouter-sort.json")
+const SORT_CONFIG_PATH = join(getAgentDir(), "openrouter-sort.json")
 
 type SortBy = "throughput" | "price" | "latency"
 
@@ -684,94 +649,6 @@ function isOpenRouterModel(value: unknown): value is OpenRouterModel {
   return isRecord(value) && typeof value.id === "string"
 }
 
-function isChatModel(model: OpenRouterModel): boolean {
-  const outputs = model.architecture?.output_modalities
-  return outputs === undefined || outputs.includes("text")
-}
-
-function priceToPerMillion(value: string | undefined): number {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed * 1_000_000 : 0
-}
-
-/** Map a live OpenRouter catalog entry to a Pi model definition. */
-function toInputModalities(model: OpenRouterModel): ("text" | "image")[] {
-  const modalities = model.architecture?.input_modalities ?? []
-  const input = modalities.filter(
-    (modality): modality is "text" | "image" =>
-      modality === "text" || modality === "image"
-  )
-  return input.length > 0 ? input : ["text"]
-}
-
-function toModelCost(
-  pricing: OpenRouterModelPricing | undefined
-): ProviderModelConfig["cost"] {
-  return {
-    input: priceToPerMillion(pricing?.prompt),
-    output: priceToPerMillion(pricing?.completion),
-    cacheRead: priceToPerMillion(pricing?.input_cache_read),
-    cacheWrite: priceToPerMillion(pricing?.input_cache_write),
-  }
-}
-
-function supportsReasoning(model: OpenRouterModel): boolean {
-  const parameters = model.supported_parameters ?? []
-  return (
-    parameters.includes("reasoning") || parameters.includes("include_reasoning")
-  )
-}
-
-function toProviderModel(model: OpenRouterModel): ProviderModelConfig {
-  const reasoning = supportsReasoning(model)
-  const contextWindow =
-    model.context_length ?? model.top_provider?.context_length ?? 128_000
-  const maxTokens =
-    model.top_provider?.max_completion_tokens ?? Math.min(contextWindow, 16_384)
-
-  return {
-    id: model.id,
-    name: model.name ?? model.id,
-    api: "openai-completions",
-    reasoning,
-    input: toInputModalities(model),
-    cost: toModelCost(model.pricing),
-    contextWindow,
-    maxTokens,
-    compat: {
-      supportsDeveloperRole: false,
-      ...(reasoning ? { thinkingFormat: "openrouter" as const } : {}),
-    },
-  }
-}
-
-function loadModelsCache(): OpenRouterModelsCache | undefined {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf-8"))
-    if (!isRecord(parsed) || !Array.isArray(parsed.models)) {
-      return undefined
-    }
-    const models = parsed.models.filter(isOpenRouterModel)
-    if (models.length === 0) {
-      return undefined
-    }
-    return {
-      checkedAt: typeof parsed.checkedAt === "number" ? parsed.checkedAt : 0,
-      models,
-    }
-  } catch {
-    return undefined
-  }
-}
-
-function saveModelsCache(models: OpenRouterModel[]): void {
-  try {
-    writeJsonFile(MODELS_CACHE_PATH, { checkedAt: Date.now(), models })
-  } catch {
-    // Cache persistence is best effort.
-  }
-}
-
 function isRecentModelEntry(value: unknown): value is RecentModelEntry {
   return (
     isRecord(value) &&
@@ -825,67 +702,19 @@ function recordModelUse(provider: string, id: string, name: string): void {
   )
 }
 
-async function fetchOpenRouterModels(
-  ctx: ExtensionContext
-): Promise<OpenRouterModel[]> {
-  let headers: Headers | undefined
-  try {
-    headers = await getOpenRouterHeaders(ctx)
-  } catch {
-    // The models catalog is public; proceed without auth headers.
-  }
-  const response = await fetch(OPENROUTER_MODELS_URL, { headers })
+/** Release timestamps from OpenRouter's public catalog, keyed by model id. */
+async function fetchReleaseDates(): Promise<Map<string, number>> {
+  const response = await fetch(OPENROUTER_MODELS_URL)
   if (!response.ok) {
     throw new Error(`OpenRouter returned HTTP ${response.status}`)
   }
   const result: unknown = await response.json()
   const data = isRecord(result) && Array.isArray(result.data) ? result.data : []
-  return data.filter(isOpenRouterModel).filter(isChatModel)
-}
-
-/**
- * Re-register the OpenRouter provider with its built-in models plus any live
- * models Pi's static catalog does not know about yet (for example stealth
- * releases such as `stealth/union-alpha`). Returns how many were new.
- */
-function registerOpenRouterModels(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  liveModels: OpenRouterModel[]
-): number {
-  const merged = new Map<string, ProviderModelConfig>()
-  for (const model of ctx.modelRegistry.getAll()) {
-    if (model.provider === "openrouter") {
-      merged.set(model.id, model)
-    }
-  }
-
-  let added = 0
-  for (const model of liveModels) {
-    if (!merged.has(model.id)) {
-      merged.set(model.id, toProviderModel(model))
-      added += 1
-    }
-  }
-
-  pi.registerProvider("openrouter", { models: [...merged.values()] })
-  return added
-}
-
-async function refreshModelsInBackground(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext
-): Promise<void> {
-  try {
-    const liveModels = await fetchOpenRouterModels(ctx)
-    if (liveModels.length === 0) {
-      return
-    }
-    saveModelsCache(liveModels)
-    registerOpenRouterModels(pi, ctx, liveModels)
-  } catch {
-    // Keep the cached catalog when OpenRouter is unreachable.
-  }
+  return new Map(
+    data
+      .filter(isOpenRouterModel)
+      .map((model): [string, number] => [model.id, model.created ?? 0])
+  )
 }
 
 /**
@@ -957,14 +786,6 @@ function queueGenerationRefresh(
 ): void {
   const refresh = refreshGeneration(state, generationId, ctx)
   state.pendingRefreshes.add(refresh)
-}
-
-function formatModelOption(
-  model: OpenRouterModel,
-  knownIds: Set<string>
-): string {
-  const badge = knownIds.has(model.id) ? "" : " [new]"
-  return `${model.name ?? model.id}${badge} — ${model.id}`
 }
 
 function formatEndpointOption(
@@ -1159,48 +980,45 @@ function registerSortCommand(pi: ExtensionAPI): void {
   })
 }
 
+/**
+ * Pi's OpenRouter models, newest release first. Pi already narrows them to the
+ * models the configured key may use, so only release dates come from OpenRouter.
+ */
+async function newestOpenRouterModels(ctx: ExtensionContext) {
+  const released = await fetchReleaseDates()
+  return ctx.modelRegistry
+    .getAll()
+    .filter((model) => model.provider === "openrouter")
+    .toSorted(
+      (left, right) =>
+        (released.get(normalizeModelId(right.id)) ?? 0) -
+        (released.get(normalizeModelId(left.id)) ?? 0)
+    )
+    .slice(0, NEWEST_MODELS_LIMIT)
+}
+
 function registerModelsCommand(pi: ExtensionAPI): void {
   pi.registerCommand("openrouter-models", {
-    description: "Fetch the latest OpenRouter models and select one",
+    description: "Select one of the newest OpenRouter models",
     handler: async (_args, ctx) => {
       try {
-        const liveModels = await fetchOpenRouterModels(ctx)
-        if (liveModels.length === 0) {
-          ctx.ui.notify("OpenRouter returned no chat models", "warning")
+        const newest = await newestOpenRouterModels(ctx)
+        if (newest.length === 0) {
+          ctx.ui.notify("No OpenRouter models are available", "warning")
           return
         }
 
-        saveModelsCache(liveModels)
-        const priorIds = new Set(
-          ctx.modelRegistry
-            .getAll()
-            .filter((model) => model.provider === "openrouter")
-            .map((model) => model.id)
-        )
-        const added = registerOpenRouterModels(pi, ctx, liveModels)
-        const recent = liveModels
-          .toSorted((left, right) => (right.created ?? 0) - (left.created ?? 0))
-          .slice(0, RECENT_MODELS_LIMIT)
-        const options = recent.map((model) =>
-          formatModelOption(model, priorIds)
-        )
-
+        const options = newest.map((model) => `${model.name} — ${model.id}`)
         const selection = await ctx.ui.select(
-          `OpenRouter models (${added} new of ${liveModels.length})`,
+          "Newest OpenRouter models",
           options
         )
         if (selection === undefined) {
           return
         }
 
-        const chosen = recent[options.indexOf(selection)]
-        if (chosen === undefined) {
-          return
-        }
-
-        const model = ctx.modelRegistry.find("openrouter", chosen.id)
+        const model = newest[options.indexOf(selection)]
         if (model === undefined) {
-          ctx.ui.notify(`Could not resolve ${chosen.id}`, "error")
           return
         }
 
@@ -1212,7 +1030,7 @@ function registerModelsCommand(pi: ExtensionAPI): void {
           )
           return
         }
-        ctx.ui.notify(`Using ${chosen.name ?? chosen.id}`, "info")
+        ctx.ui.notify(`Using ${model.name}`, "info")
       } catch (error) {
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
@@ -1423,30 +1241,6 @@ async function settleGenerationStatus(ctx: ExtensionContext): Promise<void> {
   renderOpenRouterStatus(state, ctx)
 }
 
-function registerCatalogHandlers(
-  pi: ExtensionAPI,
-  selectedRoutes: Map<string, string[]>
-): void {
-  registerSessionStatusHandlers(pi, selectedRoutes)
-
-  pi.on("session_start", (_event, ctx) => {
-    const cache = loadModelsCache()
-    if (cache !== undefined) {
-      registerOpenRouterModels(pi, ctx, cache.models)
-    }
-
-    const cacheIsFresh =
-      cache !== undefined && Date.now() - cache.checkedAt < MODELS_CACHE_TTL_MS
-    if (!cacheIsFresh) {
-      void refreshModelsInBackground(pi, ctx)
-    }
-  })
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    await settleGenerationStatus(ctx)
-  })
-}
-
 export default function openRouterProvider(pi: ExtensionAPI) {
   const selectedRoutes = loadSelectedRoutes()
   selectedSortBy = loadSelectedSort()
@@ -1456,5 +1250,9 @@ export default function openRouterProvider(pi: ExtensionAPI) {
   registerModelsCommand(pi)
   registerRecentModelsCommand(pi)
   registerModelTrackingHandlers(pi)
-  registerCatalogHandlers(pi, selectedRoutes)
+  registerSessionStatusHandlers(pi, selectedRoutes)
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    await settleGenerationStatus(ctx)
+  })
 }
