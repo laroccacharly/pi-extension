@@ -34,6 +34,10 @@ The separate `fast-codex.ts` extension adds `/fast-codex` for models on the `ope
 
 Fast mode defaults off. The toggle is saved as `"fastCodex": true` or `false` in `~/.pi/agent/settings.json` (or the directory specified by `PI_CODING_AGENT_DIR`), preserving other settings, and persists across new sessions and `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
 
+## OpenRouter fast mode
+
+The same `fast-codex.ts` extension adds `/fast-openrouter` (`on`, `off`, or no argument to toggle) for models on the `openrouter` provider. While on, every OpenRouter request carries `service_tier: "priority"` ([service tiers](https://openrouter.ai/docs/guides/features/service-tiers)), billed at the priority rate when a priority endpoint serves it. The toggle is saved as `"fastOpenRouter"` in `~/.pi/agent/settings.json`, and the footer shows `Fast`. Nothing else is changed: if the model, or the provider pinned with `/openrouter-providers`, has no priority endpoint, OpenRouter serves the request at the standard tier or the request fails.
+
 ## Venice provider
 
 The separate `venice-provider.ts` extension adds a `venice` provider for [Venice](https://venice.ai), which serves an OpenAI-compatible API at `https://api.venice.ai/api/v1`. Requests go through Pi's built-in `openai-completions` implementation.

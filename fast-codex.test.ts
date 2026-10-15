@@ -60,7 +60,7 @@ interface MockAPI {
 function setup(provider = "openai-codex") {
   const events = new Map<
     string,
-    (event: MockEvent, ctx: MockContext) => unknown
+    ((event: MockEvent, ctx: MockContext) => unknown)[]
   >()
   const commands = new Map<
     string,
@@ -87,28 +87,30 @@ function setup(provider = "openai-codex") {
   const register = fastCodex as unknown as (pi: MockAPI) => void
   register({
     on: (name, handler) => {
-      events.set(name, handler)
+      events.set(name, [...(events.get(name) ?? []), handler])
     },
     registerCommand: (name, command) => {
       commands.set(name, command)
     },
   })
-  const command = commands.get("fast-codex")
-  const request = events.get("before_provider_request")
-  const start = events.get("session_start")
-  const select = events.get("model_select")
-  assert.ok(command && request && start && select)
+  // Pi chains before_provider_request handlers; at most one mode matches.
+  const emit = (name: string, event: MockEvent) =>
+    (events.get(name) ?? [])
+      .map((handler) => handler(event, ctx))
+      .find((result) => result !== undefined)
   return {
     notifications,
     statuses,
-    command: async (args = "") => {
+    command: async (args = "", name = "fast-codex") => {
+      const command = commands.get(name)
+      assert.ok(command)
       await command.handler(args, ctx)
     },
-    request: (payload: unknown) => request({ payload }, ctx),
-    start: () => start({}, ctx),
+    request: (payload: unknown) => emit("before_provider_request", { payload }),
+    start: () => emit("session_start", {}),
     select: (nextProvider: string) => {
       ctx.model = { provider: nextProvider }
-      select({ model: ctx.model }, ctx)
+      emit("model_select", { model: ctx.model })
     },
   }
 }
@@ -239,4 +241,28 @@ await test("ignores non-object payloads", async () => {
   for (const payload of [null, undefined, [], "payload", 42]) {
     assert.equal(app.request(payload), undefined)
   }
+})
+
+await test("OpenRouter fast mode is independent of Codex fast mode", async () => {
+  const app = setup("openrouter")
+  assert.equal(app.request({}), undefined)
+  await app.command("", "fast-openrouter")
+  assert.deepEqual(app.request({ model: "openai/gpt-5" }), {
+    model: "openai/gpt-5",
+    service_tier: "priority",
+  })
+  assert.equal(app.statuses.get("fast-openrouter"), "Fast")
+  app.select("openai-codex")
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-openrouter"), undefined)
+  await app.command("on", "fast-openrouter")
+  assert.equal(app.notifications.at(-1)?.level, "warning")
+
+  const settings: unknown = JSON.parse(
+    readFileSync(join(agentDir, "settings.json"), "utf-8")
+  )
+  assert.deepEqual(settings, { fastOpenRouter: true })
+  const restarted = setup("openrouter")
+  restarted.start()
+  assert.deepEqual(restarted.request({}), { service_tier: "priority" })
 })
