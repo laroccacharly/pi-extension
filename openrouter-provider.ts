@@ -743,12 +743,25 @@ async function retryLateGeneration(
         return
       }
     }
+  } catch (error) {
+    // Background polling outlives the turn, so a failure here (including a
+    // stale ctx after the session ended) must never crash the process: the
+    // generation simply stays unresolved.
+    state.lookupFailures.set(generationId, {
+      message: error instanceof Error ? error.message : String(error),
+      retryable: false,
+    })
   } finally {
     state.lateRetries.delete(generationId)
-    clearRetrying(state, generationId, ctx)
-    // A replaced session's late work must never update the new session's UI.
-    if (generationState.current === state) {
-      renderOpenRouterStatus(state, ctx)
+    // Late polling can outlive the session, when UI updates throw.
+    try {
+      clearRetrying(state, generationId, ctx)
+      // A replaced session's late work must never update the new session's UI.
+      if (generationState.current === state) {
+        renderOpenRouterStatus(state, ctx)
+      }
+    } catch {
+      // A stale context has no UI left to update, and must not crash the agent.
     }
   }
 }
