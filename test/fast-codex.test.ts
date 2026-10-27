@@ -12,7 +12,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, test } from "node:test"
 
-import fastCodex from "./fast-codex.ts"
+import fastCodex from "../extensions/fast-codex.ts"
 
 let agentDir: string
 let previousAgentDir: string | undefined

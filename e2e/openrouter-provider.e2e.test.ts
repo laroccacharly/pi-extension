@@ -12,7 +12,7 @@ import type { OpenRouterStub, StubScenario } from "./openrouter-stub.ts"
 
 const PI_BIN = process.env.PI_BIN ?? "pi"
 const EXTENSION_PATH = fileURLToPath(
-  new URL("../openrouter-provider.ts", import.meta.url)
+  new URL("../extensions/openrouter-provider.ts", import.meta.url)
 )
 const STATUS_KEY = "openrouter-provider"
 const RETRY_STATUS_KEY = "openrouter-retries"

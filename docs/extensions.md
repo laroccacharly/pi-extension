@@ -1,0 +1,67 @@
+# Extensions
+
+Pi extension that displays the OpenRouter upstream provider used for each response, the actual USD spend, and the generation speed reported by OpenRouter.
+
+## Actual spend
+
+Pi prices OpenRouter tokens from per-model list prices, which ignore OpenRouter's per-request cost (routing, time-of-day price overrides, fees). After each assistant response the extension fetches `GET /api/v1/generation?id=<responseId>` and reads the returned `total_cost`, `tokens_completion`, `generation_time`, `native_tokens_cached`, and `native_tokens_prompt`. The footer status shows `($lastTurn), $sessionTotal, tokensPerSecond, cacheHitPercent, providerName`, i.e. last response cost, cumulative session cost, the actual generation speed in tokens per second (`tokens_completion / (generation_time / 1000)`), the cumulative prompt-cache hit rate (`native_tokens_cached / native_tokens_prompt`), and upstream provider. The cache hit rate only appears once a resolved generation reports a provider-native prompt token count, so endpoints without prompt caching do not show a misleading `0%`. When OpenRouter falls back from one or more endpoints, the provider is annotated with the attempts it fell back from, e.g. `Modal (fb: Parasail, BaseTen)`, read from the generation response's `provider_responses` chain. This is OpenRouter's authoritative billed cost, so it can differ from the estimate in Pi's built-in cost display. The totals reset when a new session starts.
+
+Every generation, including tool-call responses, goes through the same lookup. OpenRouter often needs a few seconds to index a generation, and lookups can also hit rate limits or server errors, so 404, 408, 429, 5xx, and network failures are retried: six quick attempts (about 10 seconds), then in the background with backoff for about ten more minutes. Other errors, such as an invalid key, give up immediately. While any lookup is still retrying, a separate footer entry shows `↻ N retrying`; it stays visible across status changes and model switches and disappears once nothing is retrying. When some costs are missing from the total, the main status adds `N priced` and, for lookups that gave up, `N unpriced`. If nothing has been priced yet, it shows `waiting for generation stats… (attempt N)` while retrying, or `provider unavailable (<reason>)` with OpenRouter's error message or the failed request's error.
+
+The `/openrouter-providers` command lists the five healthy endpoints with the highest 30-minute p50 throughput. Selecting one pins that provider as the only allowed endpoint (no fallbacks) in `~/.pi/agent/openrouter-provider.json`. Selecting auto-route removes the saved override and lets OpenRouter route normally.
+
+## Auto-route sort
+
+The `/openrouter-sort` command chooses how auto-routed requests are sorted: `throughput` (default), `price`, `latency`, or `OpenRouter default` to remove the sort override. The choice is stored globally in `~/.pi/agent/openrouter-sort.json` and applied to every auto-routed request by the extension itself, so it works without any `models.json` `openRouterRouting` configuration. Pinned providers ignore the sort and remain the only allowed endpoint.
+
+## Newest models
+
+`/openrouter-models` lists the 10 most recently released OpenRouter models Pi offers, newest first, and switches to the one you pick. The extension does not register models itself: since Pi 1.2 the OpenRouter model list comes from Pi, narrowed to the models your key may use with that key's limits and prices. Release dates come from OpenRouter's public `GET /api/v1/models` catalog. A model released after Pi's catalog was last updated appears once Pi's catalog includes it.
+
+## Recently used models
+
+The extension tracks the last five models you selected or used, most recent first, in `~/.pi/agent/last-models.json`. Every `model_select` and every assistant response moves the model to the front of the list, so switching with `/model`, cycling models, and simply chatting all count. The list is capped at five and de-duplicated by `provider/id`.
+
+`/last-models` shows that list as a selector. Picking an entry switches the session to it (via the same resolution path as `/model`). When nothing has been used yet the command reports that the list is empty.
+
+## Codex fast mode
+
+The separate `extensions/fast-codex.ts` extension adds `/fast-codex` for models on the `openai-codex` provider:
+
+- `/fast-codex` toggles fast mode.
+- `/fast-codex on` requests `service_tier: "priority"` on subsequent Codex requests.
+- `/fast-codex off` stops overriding the service tier.
+
+Fast mode defaults off. The toggle is saved as `"fastCodex": true` or `false` in `~/.pi/agent/settings.json` (or the directory specified by `PI_CODING_AGENT_DIR`), preserving other settings, and persists across new sessions and `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
+
+## OpenRouter fast mode
+
+The same `extensions/fast-codex.ts` extension adds `/fast-openrouter` (`on`, `off`, or no argument to toggle) for models on the `openrouter` provider. While on, every OpenRouter request carries `service_tier: "priority"` ([service tiers](https://openrouter.ai/docs/guides/features/service-tiers)), billed at the priority rate when a priority endpoint serves it. The toggle is saved as `"fastOpenRouter"` in `~/.pi/agent/settings.json`, and the footer shows `Fast`. Nothing else is changed: if the model, or the provider pinned with `/openrouter-providers`, has no priority endpoint, OpenRouter serves the request at the standard tier or the request fails.
+
+## Venice provider
+
+The separate `extensions/venice-provider.ts` extension adds a `venice` provider for [Venice](https://venice.ai), which serves an OpenAI-compatible API at `https://api.venice.ai/api/v1`. Requests go through Pi's built-in `openai-completions` implementation.
+
+- `/login-venice` prompts for an API key and saves it to `~/.pi/agent/venice.json` (mode 0600). Without a saved key, the provider reads `VENICE_API_KEY`. Venice models only appear in `/model` once one of the two is set.
+- Models come from Venice's public `GET /models?type=text` catalog, filtered to online models that support function calling (Pi's tools need it). Context window, output limit, vision, reasoning, and USD pricing are mapped from `model_spec`. The catalog is cached in `~/.pi/agent/venice-models-cache.json` and refreshed when `/model` opens.
+- Every Venice request sets `venice_parameters.include_venice_system_prompt: false`, so Venice does not prepend its own system prompt to Pi's.
+
+`PI_VENICE_API_URL` overrides the API base URL for testing.
+
+## Development
+
+```bash
+npm install --ignore-scripts
+npm run check
+npm test
+npm run test:e2e
+npm run format
+```
+
+`npm run test:e2e` runs the real `pi` binary (override with `PI_BIN`) in RPC mode with only this extension loaded, against a local OpenRouter stub (`e2e/openrouter-stub.ts`). Each test starts the stub on a random port with a scripted scenario (streamed completions, tool calls, generation lookups that 404 for a number of attempts or fail with an HTTP error), points Pi's `openrouter` provider at it through an isolated `HOME`/`models.json`, and asserts on the footer statuses Pi emits as `setStatus` events. Two environment variables make this possible and are only meant for testing: `PI_OPENROUTER_API_URL` replaces the `https://openrouter.ai/api/v1` base used by the extension, and `PI_OPENROUTER_RETRY_DELAY_SCALE` multiplies the generation retry delays (the tests use `0.01`). The tests are skipped when `pi` is not installed.
+
+Linting uses Oxlint with Ultracite's core rules. Formatting uses Oxfmt with Ultracite defaults.
+
+## Known routing behavior
+
+When a provider is selected, the extension sends `provider.only` with the chosen endpoint and `allow_fallbacks: false`, and it never forces price-based sorting or the `:floor` model variant. Requests are therefore pinned to that provider (or fail) instead of being reranked by OpenRouter. Auto-route applies the sort selected with `/openrouter-sort` (throughput by default), overriding any `openRouterRouting.sort` configured in `models.json`.
