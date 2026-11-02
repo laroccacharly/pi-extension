@@ -48,6 +48,16 @@ The separate `extensions/venice-provider.ts` extension adds a `venice` provider 
 
 `PI_VENICE_API_URL` overrides the API base URL for testing.
 
+## Secret redaction
+
+The separate `extensions/redact-secrets.ts` extension hides anything in the transcript that looks like an API key or secret, using a pure-text heuristic: it never reads environment variables or your data.
+
+- Tokens are maximal runs of letters, digits, `_`, and `-`. URLs, paths, and emails split into short pieces, while a key inside a URL query or an `Authorization` header stays one token.
+- Tokens with a known prefix (`sk-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `AKIA`, `ASIA`, `xoxb-`, `xoxp-`, `xoxa-`, `AIza`, `glpat-`, `eyJ`) are redacted when at least 16 characters, including a digit, follow the prefix.
+- Other tokens of at least 32 characters that mix upper case, lower case, and digits and have a Shannon entropy of at least 4 bits per character are redacted too, unless 60% or more of their characters sit in camelCase words (`getUserAccountSettings2024ForAdminPanel` reads as an identifier; about 1% of random keys do too and slip through). Pure lowercase hex (git SHAs, sha256 hashes, UUIDs) is deliberately left alone, as are ordinary words and identifiers.
+
+Redacted text becomes `[REDACTED]`. It applies to tool results (text, structured content, and details such as edit diffs) and to your own input before it reaches the model.
+
 ## Development
 
 ```bash

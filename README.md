@@ -1,6 +1,6 @@
 # pi-extension
 
-[Pi](https://pi.dev) extensions: OpenRouter actual spend, provider pinning and routing, Codex and OpenRouter fast mode, and a [Venice](https://venice.ai) provider.
+[Pi](https://pi.dev) extensions: OpenRouter actual spend, provider pinning and routing, Codex and OpenRouter fast mode, a [Venice](https://venice.ai) provider, and redaction of key-like secrets from the transcript.
 
 ## Requirements
 
@@ -10,5 +10,5 @@
 ## Installation
 
 ```bash
-pi install git:github.com/laroccacharly/pi-extension@v0.1.0
+pi install git:github.com/laroccacharly/pi-extension@v0.2.0
 ```

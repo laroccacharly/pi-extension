@@ -1,8 +1,8 @@
 {
   "name": "pi-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
-  "description": "Pi extensions: OpenRouter spend and routing, Codex and OpenRouter fast mode, and a Venice provider.",
+  "description": "Pi extensions: OpenRouter spend and routing, Codex and OpenRouter fast mode, a Venice provider, and secret redaction.",
   "keywords": [
     "codex",
     "extension",
