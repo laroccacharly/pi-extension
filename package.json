@@ -1,6 +1,6 @@
 {
   "name": "pi-extension",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "description": "Pi extensions: OpenRouter spend and routing, Codex and OpenRouter fast mode, a Venice provider, and secret redaction.",
   "keywords": [
@@ -28,6 +28,7 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
+    "release": "git add -A && git commit -m v$npm_package_version && git tag v$npm_package_version && git push origin master v$npm_package_version",
     "test": "node --test test/*.test.ts",
     "test:e2e": "node --test e2e/*.test.ts",
     "typecheck": "tsc --noEmit"
