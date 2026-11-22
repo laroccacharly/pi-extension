@@ -26,17 +26,17 @@ The extension tracks the last five models you selected or used, most recent firs
 
 ## Codex fast mode
 
-The separate `extensions/fast-codex.ts` extension adds `/fast-codex` for models on the `openai-codex` provider:
+The separate `extensions/fast-codex.ts` extension adds `/fast-codex`, which can be run from any model:
 
 - `/fast-codex` toggles fast mode.
-- `/fast-codex on` requests `service_tier: "priority"` on subsequent Codex requests.
+- `/fast-codex on` requests `service_tier: "priority"` on subsequent Responses API requests from the `openai` provider.
 - `/fast-codex off` stops overriding the service tier.
 
-Fast mode defaults off. The toggle is saved as `"fastCodex": true` or `false` in `~/.pi/agent/settings.json` (or the directory specified by `PI_CODING_AGENT_DIR`), preserving other settings, and persists across new sessions and `/reload`. While enabled, the footer shows `Codex fast: on` when a Codex model is selected. Switching to another provider leaves its requests unchanged. Priority availability and higher usage charges depend on your OpenAI account and model; this does not change the thinking level.
+Fast mode defaults off. The toggle is saved as `"fastOpenAI": true` or `false` in `~/.pi/agent/settings.json` (or the directory specified by `PI_CODING_AGENT_DIR`), preserving other settings, and persists across new sessions and `/reload`. While enabled, the footer shows `Codex fast: on` when an applicable OpenAI model is selected. Legacy `openai-codex` and other providers are unchanged. If fast mode was enabled for legacy Codex, run `/fast-codex on` again to opt in to OpenAI priority billing. [Fast mode availability and pricing](https://developers.openai.com/api/docs/guides/fast-mode) depend on your OpenAI account and model; this does not change the thinking level.
 
 ## OpenRouter fast mode
 
-The same `extensions/fast-codex.ts` extension adds `/fast-openrouter` (`on`, `off`, or no argument to toggle) for models on the `openrouter` provider. While on, every OpenRouter request carries `service_tier: "priority"` ([service tiers](https://openrouter.ai/docs/guides/features/service-tiers)), billed at the priority rate when a priority endpoint serves it. The toggle is saved as `"fastOpenRouter"` in `~/.pi/agent/settings.json`, and the footer shows `Fast`. Nothing else is changed: if the model, or the provider pinned with `/openrouter-providers`, has no priority endpoint, OpenRouter serves the request at the standard tier or the request fails.
+The same `extensions/fast-codex.ts` extension adds `/fast-openrouter` (`on`, `off`, or no argument to toggle), which can be run from any model. While on, every OpenRouter request carries `service_tier: "priority"` ([service tiers](https://openrouter.ai/docs/guides/features/service-tiers)), billed at the priority rate when a priority endpoint serves it. The toggle is saved as `"fastOpenRouter"` in `~/.pi/agent/settings.json`, and the footer shows `Fast` only while an OpenRouter model is selected and fast mode is on. Nothing else is changed: if the model, or the provider pinned with `/openrouter-providers`, has no priority endpoint, OpenRouter serves the request at the standard tier or the request fails.
 
 ## Venice provider
 

@@ -11,6 +11,7 @@ import type {
 interface FastMode {
   command: string
   provider: string
+  api?: string
   settingKey: string
   label: string
   // Footer status while fast mode is on and the provider is selected.
@@ -28,8 +29,9 @@ interface FastModeState {
 const MODES: FastMode[] = [
   {
     command: "fast-codex",
-    provider: "openai-codex",
-    settingKey: "fastCodex",
+    provider: "openai",
+    api: "openai-responses",
+    settingKey: "fastOpenAI",
     label: "Codex",
     status: "Codex fast: on",
     onNote: "priority service; higher usage charges",
@@ -87,15 +89,52 @@ function saveEnabled(
   })
 }
 
+function appliesToModel(
+  mode: FastMode,
+  model: ExtensionContext["model"]
+): boolean {
+  return (
+    model?.provider === mode.provider &&
+    (mode.api === undefined || model.api === mode.api)
+  )
+}
+
 function updateStatus(
   ctx: ExtensionContext,
   state: FastModeState,
-  provider: string | undefined
+  model: ExtensionContext["model"]
 ): void {
   const { mode } = state
   ctx.ui.setStatus(
     mode.command,
-    state.enabled && provider === mode.provider ? mode.status : undefined
+    state.enabled && appliesToModel(mode, model) ? mode.status : undefined
+  )
+}
+
+function notifyToggle(
+  ctx: ExtensionCommandContext,
+  state: FastModeState
+): void {
+  const { enabled, mode } = state
+  if (!enabled) {
+    ctx.ui.notify(`${mode.label} fast mode off`, "info")
+    return
+  }
+  const message = `${mode.label} fast mode on (${mode.onNote})`
+  if (appliesToModel(mode, ctx.model)) {
+    ctx.ui.notify(message, "info")
+    return
+  }
+  if (mode.provider === "openai" && ctx.model?.provider === "openai-codex") {
+    ctx.ui.notify(
+      `${message}. Saved for eligible openai models; legacy openai-codex is not supported.`,
+      "warning"
+    )
+    return
+  }
+  ctx.ui.notify(
+    `${message}. Saved for eligible ${mode.provider} models.`,
+    "info"
   )
 }
 
@@ -110,11 +149,6 @@ async function toggle(
     ctx.ui.notify(`Usage: /${mode.command} [on|off]`, "warning")
     return
   }
-  if (ctx.model?.provider !== mode.provider) {
-    ctx.ui.notify(`/${mode.command} requires a ${mode.label} model`, "warning")
-    return
-  }
-
   await ctx.waitForIdle()
   const nextEnabled = arg === "" ? !state.enabled : arg === "on"
   try {
@@ -124,13 +158,8 @@ async function toggle(
     return
   }
   state.enabled = nextEnabled
-  updateStatus(ctx, state, ctx.model.provider)
-  ctx.ui.notify(
-    state.enabled
-      ? `${mode.label} fast mode on (${mode.onNote})`
-      : `${mode.label} fast mode off`,
-    "info"
-  )
+  updateStatus(ctx, state, ctx.model)
+  notifyToggle(ctx, state)
 }
 
 function registerFastMode(
@@ -153,17 +182,17 @@ function registerFastMode(
 
   pi.on("session_start", (_event, ctx) => {
     state.enabled = loadEnabled(configPath, mode.settingKey)
-    updateStatus(ctx, state, ctx.model?.provider)
+    updateStatus(ctx, state, ctx.model)
   })
 
   pi.on("model_select", (event, ctx) => {
-    updateStatus(ctx, state, event.model.provider)
+    updateStatus(ctx, state, event.model)
   })
 
   pi.on("before_provider_request", (event, ctx) => {
     if (
       !state.enabled ||
-      ctx.model?.provider !== mode.provider ||
+      !appliesToModel(mode, ctx.model) ||
       !isRecord(event.payload)
     ) {
       return

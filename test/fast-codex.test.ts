@@ -32,8 +32,13 @@ afterEach(() => {
   rmSync(agentDir, { recursive: true, force: true })
 })
 
+interface MockModel {
+  provider: string
+  api: string
+}
+
 interface MockContext {
-  model: { provider: string }
+  model: MockModel | undefined
   waitForIdle: () => Promise<void>
   ui: {
     notify: (message: string, level: string) => void
@@ -43,7 +48,7 @@ interface MockContext {
 
 interface MockEvent {
   payload?: unknown
-  model?: { provider: string }
+  model?: MockModel | undefined
 }
 
 interface MockAPI {
@@ -57,7 +62,7 @@ interface MockAPI {
   ) => void
 }
 
-function setup(provider = "openai-codex") {
+function setup(provider = "openai") {
   const events = new Map<
     string,
     ((event: MockEvent, ctx: MockContext) => unknown)[]
@@ -69,7 +74,7 @@ function setup(provider = "openai-codex") {
   const notifications: { message: string; level: string }[] = []
   const statuses = new Map<string, string | undefined>()
   const ctx: MockContext = {
-    model: { provider },
+    model: { provider, api: "openai-responses" },
     waitForIdle: async () => {
       await Promise.resolve()
     },
@@ -108,9 +113,12 @@ function setup(provider = "openai-codex") {
     },
     request: (payload: unknown) => emit("before_provider_request", { payload }),
     start: () => emit("session_start", {}),
-    select: (nextProvider: string) => {
-      ctx.model = { provider: nextProvider }
+    select: (nextProvider: string, api = "openai-responses") => {
+      ctx.model = { provider: nextProvider, api }
       emit("model_select", { model: ctx.model })
+    },
+    clearModel: () => {
+      ctx.model = undefined
     },
   }
 }
@@ -149,19 +157,47 @@ await test("invalid arguments do not change the mode", async () => {
   assert.deepEqual(app.request({}), { service_tier: "priority" })
 })
 
-await test("only affects Codex, including after switching models", async () => {
-  const app = setup()
+await test("saves fast mode without an eligible model selected", async () => {
+  const app = setup("anthropic")
+  app.clearModel()
   await app.command("on")
-  for (const provider of ["openai", "openrouter", "anthropic"]) {
-    app.select(provider)
-    assert.equal(app.request({}), undefined)
-    assert.equal(app.statuses.get("fast-codex"), undefined)
-    await app.command("off")
-    assert.equal(app.notifications.at(-1)?.level, "warning")
-  }
-  app.select("openai-codex")
+  assert.match(
+    app.notifications.at(-1)?.message ?? "",
+    /Saved for eligible openai models/u
+  )
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+  assert.equal(app.request({}), undefined)
+
+  app.select("openai")
   assert.deepEqual(app.request({}), { service_tier: "priority" })
   assert.equal(app.statuses.get("fast-codex"), "Codex fast: on")
+
+  app.select("anthropic")
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+  await app.command("off")
+  app.select("openai")
+  assert.equal(app.request({}), undefined)
+})
+
+await test("warns on legacy Codex but saves fast mode for OpenAI", async () => {
+  const app = setup("openai-codex")
+  await app.command()
+  assert.equal(app.notifications.at(-1)?.level, "warning")
+  assert.match(app.notifications.at(-1)?.message ?? "", /legacy openai-codex/u)
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+
+  app.select("openai", "openai-decisions")
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+
+  app.select("openai", "openai-completions")
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+
+  app.select("openai")
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
 })
 
 await test("fast mode persists across new sessions and extension reloads", async () => {
@@ -183,9 +219,22 @@ await test("fast mode persists across new sessions and extension reloads", async
   assert.equal(restarted.statuses.get("fast-codex"), undefined)
 })
 
+await test("legacy fast mode does not opt OpenAI in to premium billing", async () => {
+  writeFileSync(
+    join(agentDir, "settings.json"),
+    JSON.stringify({ fastCodex: true })
+  )
+  const app = setup()
+  app.start()
+  assert.equal(app.request({}), undefined)
+  assert.equal(app.statuses.get("fast-codex"), undefined)
+  await app.command("on")
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
+})
+
 await test("preserves other settings, including changes since startup", async () => {
   const path = join(agentDir, "settings.json")
-  writeFileSync(path, JSON.stringify({ theme: "dark", fastCodex: true }))
+  writeFileSync(path, JSON.stringify({ theme: "dark", fastOpenAI: true }))
   const app = setup()
   app.start()
   assert.deepEqual(app.request({}), { service_tier: "priority" })
@@ -194,7 +243,7 @@ await test("preserves other settings, including changes since startup", async ()
   await app.command("off")
   assert.deepEqual(JSON.parse(readFileSync(path, "utf-8")), {
     ...settings,
-    fastCodex: false,
+    fastOpenAI: false,
   })
 })
 
@@ -212,7 +261,7 @@ await test("writes through symlinked settings without replacing the link", async
     assert.equal(readlinkSync(path), target)
     assert.deepEqual(JSON.parse(readFileSync(target, "utf-8")), {
       ...settings,
-      fastCodex: enabled,
+      fastOpenAI: enabled,
     })
     assert.deepEqual(
       app.request({}),
@@ -244,24 +293,27 @@ await test("ignores non-object payloads", async () => {
 })
 
 await test("OpenRouter fast mode is independent of Codex fast mode", async () => {
-  const app = setup("openrouter")
-  assert.equal(app.request({}), undefined)
+  const app = setup()
   await app.command("", "fast-openrouter")
+  assert.equal(app.notifications.at(-1)?.level, "info")
+  assert.equal(app.statuses.get("fast-openrouter"), undefined)
+  assert.equal(app.request({}), undefined)
+  app.select("openrouter")
   assert.deepEqual(app.request({ model: "openai/gpt-5" }), {
     model: "openai/gpt-5",
     service_tier: "priority",
   })
   assert.equal(app.statuses.get("fast-openrouter"), "Fast")
-  app.select("openai-codex")
+  app.select("openai")
   assert.equal(app.request({}), undefined)
   assert.equal(app.statuses.get("fast-openrouter"), undefined)
-  await app.command("on", "fast-openrouter")
-  assert.equal(app.notifications.at(-1)?.level, "warning")
+  await app.command("on")
+  assert.deepEqual(app.request({}), { service_tier: "priority" })
 
   const settings: unknown = JSON.parse(
     readFileSync(join(agentDir, "settings.json"), "utf-8")
   )
-  assert.deepEqual(settings, { fastOpenRouter: true })
+  assert.deepEqual(settings, { fastOpenRouter: true, fastOpenAI: true })
   const restarted = setup("openrouter")
   restarted.start()
   assert.deepEqual(restarted.request({}), { service_tier: "priority" })
